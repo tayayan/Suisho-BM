@@ -71,7 +71,7 @@ SOURCES = \
 	eval/evaluate_bona_piece.cpp \
 	eval/material/evaluate_material.cpp \
 	testcmd/benchmark.cpp \
-	engine/user-engine/hisshi_dfpn.cpp \
+	engine/user-engine/solver.cpp \
 	engine/user-engine/user-search.cpp
 
 OBJECTS = $(addprefix $(OBJDIR)/, $(SOURCES:.cpp=.o))

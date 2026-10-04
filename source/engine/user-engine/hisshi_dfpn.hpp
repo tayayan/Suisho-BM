@@ -56,7 +56,6 @@ struct Result {
   std::uint64_t elapsed_ms = 0;
   std::vector<Move> pv;
   bool verified = false;
-  std::uint64_t verify_nodes = 0;
   std::string verify_info;
 };
 
@@ -100,6 +99,10 @@ struct alignas(64) Cluster {
 };
 static_assert(sizeof(Cluster) == 192, "cluster size");
 
+namespace detail {
+struct SearchImpl;
+}
+
 class Solver {
  public:
   void Resize(std::size_t mb);
@@ -107,13 +110,14 @@ class Solver {
   Result Solve(Position& root, const Limits& limits, const Options& opt,
                bool (*should_stop)());
   int Hashfull() const;
+  std::size_t TableBytes() const { return table_.size() * sizeof(Cluster); }
   void KeepOnlyProofs();
   // TT locking while several threads use the table.
   bool Shared() const { return shared_; }
   void SetShared(bool v) { shared_ = v; }
 
  private:
-  friend struct SearchImpl;
+  friend struct detail::SearchImpl;
   std::vector<Cluster> table_;
   std::size_t cluster_count_ = 0;
 

@@ -111,7 +111,11 @@ checkmate S*2c 2b1c 2c3d+
 
 | パス | 内容 |
 |---|---|
-| `source/engine/user-engine/hisshi_dfpn.{hpp,cpp}` | 必至探索・検証・解答作成 |
+| `source/engine/user-engine/hisshi_dfpn.hpp` | 探索の設定・結果・置換表（外部とのインターフェース） |
+| `source/engine/user-engine/search.hpp` | 必至探索（仮想パス付き df-pn+、指し手生成、証明の再生） |
+| `source/engine/user-engine/verify.hpp` | 証明・反証の独立検証 |
+| `source/engine/user-engine/answer.hpp` | 解答手順の作成（最長の受け・最短の攻め・無駄合いの除外） |
+| `source/engine/user-engine/solver.cpp` | 置換表の管理と全体の流れ（並列探索 → 検証 → 解答作成） |
 | `source/engine/user-engine/user-search.cpp` | USI との接続 |
 | `source/` のその他 | やねうら王から必要な部分だけを抜き出したもの（盤面・指し手生成・1 手詰め・USI など） |
 | `build.ps1` / `source/Makefile` | ビルド |

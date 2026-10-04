@@ -2568,7 +2568,25 @@ struct PvBuilder {
         chosen = m;
         break;
       }
-      if (chosen == MOVE_NONE) break;
+      if (chosen == MOVE_NONE) {
+        // The replies that last k - 1 plies were all left out as futile
+        // interpositions (the length search counts them): the longest of the
+        // remaining real defences, with its own length.
+        int best_len = -1;
+        for (const Move m : Replies(h)) {
+          if (KnownMated(h, m, st[ply]) || ReplyMated(h, m, st[ply])) continue;
+          if (IsInterposition(p, m, slider) && FutileAtOnce(h, m, slider, 1)) continue;
+          if (IsInterposition(p, m, slider) && Futile(h, m, slider)) continue;
+          p.do_move(m, st[ply]);
+          int len = -1;
+          for (int j = 1; j <= k - 3; j += 2)
+            if (OrWithin(h, slider, j)) { len = j; break; }
+          p.undo_move(m);
+          if (len > best_len) { best_len = len; chosen = m; }
+        }
+        if (chosen == MOVE_NONE || best_len < 0) break;
+        k = best_len + 1;
+      }
       pv.push_back(chosen);
       p.do_move(chosen, st[ply++]);
       --k;

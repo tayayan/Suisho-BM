@@ -45,6 +45,10 @@ struct Options {
   int single_thread_eps = 50;  // eps_percent of a search with one thread (no helpers to vary it)
   int deep_pn = 16;          // unknown children start with pn 1 + depth / deep_pn (0: off)
   int threads = 1;           // search threads sharing the TT
+  // Futile interpositions (無駄合い) left out of the displayed answer: 0 none
+  // (every interposition is a defence), 1 the futility rules with the chains
+  // of interpositions judged from their end.
+  int futile = 0;
 };
 
 enum class Status { kUnknown, kProven, kDisproven };

@@ -32,6 +32,9 @@ void USI::extra_option(USI::OptionsMap& o) {
   o["HisshiFullWidth"] << USI::Option(false);
   // Progress output interval in ms (0 = none).
   o["PvInterval"] << USI::Option(1000, 0, 1000000);
+  // Futile interpositions (無駄合い) in the answer: 0 every interposition is
+  // shown as a defence, 1 futile interpositions are left out.
+  o["HisshiFutile"] << USI::Option(0, 0, 1);
 }
 
 void Search::init() {}
@@ -52,6 +55,7 @@ void MainThread::search() {
 
   hisshi::Options opt;
   opt.full_width = static_cast<bool>(Options["HisshiFullWidth"]);
+  opt.futile = static_cast<int>(Options["HisshiFutile"]);
   opt.threads = static_cast<int>(Options["Threads"]);
 
   const auto res = g_solver.Solve(rootPos, lim, opt, &ShouldStop);

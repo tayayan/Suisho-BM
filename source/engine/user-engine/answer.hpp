@@ -126,7 +126,9 @@ struct AnswerPool {
 // piece is not handed back to the defender: with it handed back, the paper's
 // Fig. 4 (▽9一飛 ▲9一同飛成) would not be futile. Inside these length
 // searches an interposition counts as futile only when the capture brings
-// hisshi back at once.
+// hisshi back at once, or when it belongs to a chain judged futile (see
+// ChainFutile). Futile interpositions are told apart only with
+// Options::futile; without it every interposition is a defence.
 struct PvBuilder {
   Solver& solver;
   const Options& opt;
@@ -164,8 +166,10 @@ struct PvBuilder {
     return mated;
   }
 
+  // Every futility rule starts here: without Options::futile no
+  // interposition is told apart from the other defences.
   bool IsInterposition(const Position& p, Move r, Square slider) const {
-    if (!is_drop(r) || slider == SQ_NB) return false;
+    if (!opt.futile || !is_drop(r) || slider == SQ_NB) return false;
     const Piece pc = p.piece_on(slider);
     if (pc == NO_PIECE || color_of(pc) != atk || !IsSlider(type_of(pc))) return false;
     return static_cast<bool>(effects_from(pc, slider, p.pieces()) & Bitboard(to_sq(r)));
@@ -276,6 +280,7 @@ struct PvBuilder {
 
   // ---- exact lengths (plies until hisshi is reached) ------------------------
   static constexpr int kMaxLength = 12;               // futility compares lengths up to this
+  static constexpr int kMaxLengthChain = 40;          // the same in the chain judgements
   static constexpr int kMaxAnswer = 255;              // longest answer searched for
   static constexpr std::uint64_t kBudget = 3000000;   // length-search visits per answer
   static constexpr std::uint64_t kReprove = 5000000;       // re-proof of an evicted position
@@ -295,10 +300,14 @@ struct PvBuilder {
   // position. When the position's proof has been evicted from the TT (the
   // table can be full on large problems), it is proven again first.
   std::unordered_map<Key, std::vector<std::pair<int, Move>>> proven_cache;
+  std::unordered_set<Key> reprove_tried;  // (position, budget) re-proofs tried inside futility tests
   const std::vector<std::pair<int, Move>>& ProvenMoves(SearchImpl& h) {
-    const auto it = proven_cache.find(h.pos.key());
+    // Inside futility tests evicted proofs are re-proved with a smaller
+    // budget (or not at all): those lists are kept apart.
+    const Key key = futility_depth ? Mix(h.pos.key(), 29) : h.pos.key();
+    const auto it = proven_cache.find(key);
     if (it != proven_cache.end()) return it->second;
-    return proven_cache[h.pos.key()] = ProvenMovesUncached(h);
+    return proven_cache[key] = ProvenMovesUncached(h);
   }
 
   std::vector<std::pair<int, Move>> ProvenMovesUncached(SearchImpl& h) {
@@ -308,6 +317,9 @@ struct PvBuilder {
       if (attempt == 1) {
         const Probe self = h.Lookup(BoardKey(p), p.hand_of(atk), kModeHisshi);
         if (self.dn == 0) break;
+        // Inside futility tests (positions outside the proof, many of them) a
+        // re-proof is tried once per position for the whole answer.
+        if (futility_depth && !reprove_tried.insert(Mix(p.key(), ReproveBudget())).second) break;
         if (self.pn != 0) {
           // Usually a plain mate: try the cheaper mate search first.
           if (h.SubSearch(kModeMate, kMateProbe).pn != 0) h.SubSearch(kModeHisshi, ReproveBudget());
@@ -342,7 +354,7 @@ struct PvBuilder {
   bool OrWithin(SearchImpl& h, Square slider, int k) {
     if (k <= 0) return false;
     Position& p = h.pos;
-    Bounds& bd = bounds[Mix(Mix(p.key(), slider), 1)];
+    Bounds& bd = bounds[Mix(Mix(p.key(), slider), chain_eval ? 11 : 1)];
     if (k >= bd.hi) return true;
     if (k <= bd.lo || visits >= kBudget) return false;
     ++visits;
@@ -357,7 +369,7 @@ struct PvBuilder {
       p.undo_move(m);
       if (ok) break;
     }
-    Bounds& b2 = bounds[Mix(Mix(p.key(), slider), 1)];
+    Bounds& b2 = bounds[Mix(Mix(p.key(), slider), chain_eval ? 11 : 1)];
     if (ok) b2.hi = std::min(b2.hi, k);
     else if (visits < kBudget) b2.lo = std::max(b2.lo, k);
     return ok;
@@ -369,7 +381,7 @@ struct PvBuilder {
   bool AndWithin(SearchImpl& h, Square slider, int k) {
     if (k < 0) return false;
     Position& p = h.pos;
-    Bounds& bd = bounds[Mix(Mix(p.key(), slider), 2)];
+    Bounds& bd = bounds[Mix(Mix(p.key(), slider), chain_eval ? 12 : 2)];
     if (k >= bd.hi) return true;
     if (k <= bd.lo || visits >= kBudget) return false;
     ++visits;
@@ -385,11 +397,13 @@ struct PvBuilder {
       }
       if (answered) continue;
       if (ReplyMated(h, m, st)) continue;
-      if (IsInterposition(p, m, slider) && FutileAtOnce(h, m, slider, 1)) continue;
+      if (IsInterposition(p, m, slider) &&
+          (FutileAtOnce(h, m, slider, 1) || (!chain_eval && ChainDrop(p, m, slider) && ChainFutile(h, m, slider))))
+        continue;
       ok = false;
       break;
     }
-    Bounds& b2 = bounds[Mix(Mix(p.key(), slider), 2)];
+    Bounds& b2 = bounds[Mix(Mix(p.key(), slider), chain_eval ? 12 : 2)];
     if (ok) b2.hi = std::min(b2.hi, k);
     else if (visits < kBudget) b2.lo = std::max(b2.lo, k);
     return ok;
@@ -431,6 +445,229 @@ struct PvBuilder {
     return false;
   }
 
+  // ---- chains of interpositions ---------------------------------------------
+  // A drop of a chain: between the slider and the defender's king, reached by
+  // the slider and capturable by it.
+  bool ChainDrop(Position& p, Move r, Square slider) {
+    if (!IsInterposition(p, r, slider)) return false;
+    const Square ksq = p.king_square(~atk);
+    if (ksq == SQ_NB) return false;
+    if (!(between_bb(slider, ksq) & Bitboard(to_sq(r)))) return false;
+    StateInfo st;
+    p.do_move(r, st);
+    const bool capturable = !Captures(p, slider, to_sq(r)).empty();
+    p.undo_move(r);
+    return capturable;
+  }
+
+  // Defender to move: is hisshi reached within k plies against every reply
+  // except the drops of the chain on the slider's line (the real defences)?
+  bool RealWithin(SearchImpl& h, Square slider, int k) {
+    Position& p = h.pos;
+    StateInfo st;
+    for (const Move m : Replies(h)) {
+      if (ChainDrop(p, m, slider)) continue;
+      if (KnownMated(h, m, st)) continue;
+      // In chain judgements most replies of the (new) positions are simply
+      // mated: the mate probe first, before a length search that may have to
+      // re-prove positions.
+      if (ReplyMated(h, m, st)) continue;
+      if (k > 0) {
+        p.do_move(m, st);
+        const bool ok = OrWithin(h, slider, k - 1);
+        p.undo_move(m);
+        if (ok) continue;
+      }
+      if (IsInterposition(p, m, slider) && FutileAtOnce(h, m, slider, 1)) continue;
+      return false;
+    }
+    return true;
+  }
+
+  // An interposition of a chain is futile when, after its capture, hisshi is
+  // reached no later than through the real defences of the position without
+  // it: the drop and the capture only add their two plies. The chain is
+  // judged from its end: a later interposition judged futile does not count
+  // (its two plies are taken off), a later one that is not futile counts
+  // with its length. The lengths compared are made shortest first by
+  // bounded-length searches (a search of its own, in a table of its own); a
+  // proof found is copied into the main table and the answer is rebuilt with
+  // it in the next round.
+  static constexpr std::size_t kShortTableMb = 128;
+  static constexpr std::uint64_t kShortCall = 3000000;    // nodes of one bounded search (proofs need ~1M)
+  static constexpr std::uint64_t kShortBudget = 8000000;  // nodes of all bounded searches of one answer
+  std::unique_ptr<Solver> short_solver;
+  std::unique_ptr<SearchImpl> short_search;
+  std::uint64_t short_nodes = 0;
+  int chain_eval = 0;          // inside a chain judgement (no other chain judged from its lengths)
+  bool chain_restart = false;  // a shorter proof was copied: rebuild the answer
+  std::unordered_map<Key, bool> chain_memo;     // per round
+  std::unordered_map<Key, int> real_memo;       // per round
+  std::unordered_map<Key, int> shortest_memo;   // kept across rounds
+  std::unordered_map<Key, bool> bound_memo;     // kept across rounds
+
+  SearchImpl& ShortSearcher(SearchImpl& h) {
+    if (!short_search) {
+      short_solver = std::make_unique<Solver>();
+      short_solver->Resize(kShortTableMb);
+      Options so = opt;
+      so.cache_slots = 256;
+      so.threads = 1;
+      so.eps_percent = std::max(so.eps_percent, 50);  // without it the bounded searches rarely decide
+      Limits sl;
+      sl.pv_interval_ms = 0;
+      short_search = std::make_unique<SearchImpl>(*short_solver, h.pos, so, sl, nullptr, 0, nullptr, atk);
+    }
+    return *short_search;
+  }
+
+  // Attacker to move: is hisshi reached within d plies? One bounded search
+  // (a proof found is copied into the main table).
+  bool BoundedSearch(SearchImpl& h, int d) {
+    if (d < 1 || short_nodes >= kShortBudget) return false;
+    SearchImpl& s2 = ShortSearcher(h);
+    short_solver->Clear();
+    const std::uint64_t n0 = s2.nodes;
+    const bool ok = s2.ShortSearch(d, std::min(kShortCall, kShortBudget - short_nodes));
+    short_nodes += s2.nodes - n0;
+    if (!ok) return false;
+    CopyProof(s2, h, d);
+    chain_restart = true;
+    return true;
+  }
+
+  // Copies the proof of the current position from the bounded search's table
+  // into the main table: the best move at attacker nodes, every reply at
+  // defender nodes, `depth` plies deep (with the whole attacker's hand).
+  void CopyProof(SearchImpl& from, SearchImpl& to, int depth) {
+    Position& p = to.pos;
+    const Key board = BoardKey(p);
+    const Hand hand = p.hand_of(atk);
+    const Probe pr = from.Lookup(board, hand, kModeHisshi);
+    if (pr.pn != 0) return;
+    const bool or_node = p.side_to_move() == atk;
+    const Move best = or_node ? p.to_move(Move16(pr.best)) : MOVE_NONE;
+    to.Store(board, hand, kModeHisshi, 0, kInf, pr.len, best, false, 1000);
+    if (depth <= 0) return;
+    StateInfo st;
+    if (or_node) {
+      if (best == MOVE_NONE || !p.pseudo_legal_s<true>(best) || !p.legal(best)) return;
+      p.do_move(best, st);
+      CopyProof(from, to, depth - 1);
+      p.undo_move(best);
+      return;
+    }
+    for (const auto& em : MoveList<LEGAL_ALL>(p)) {
+      p.do_move(em.move, st);
+      CopyProof(from, to, depth - 1);
+      p.undo_move(em.move);
+    }
+  }
+
+  // Attacker to move, hisshi known within `upper` plies: bounded searches at
+  // upper - 2, upper - 4, ... (the longer limits first) until one fails.
+  void Shortest(SearchImpl& h, int upper) {
+    const Key key = Mix(h.pos.key(), 13);
+    if (shortest_memo.count(key)) return;
+    int best = upper;
+    for (int d = upper - 2; d >= 1 && BoundedSearch(h, d); d -= 2) best = d;
+    shortest_memo[key] = best;
+  }
+
+  // Attacker to move: hisshi within d plies by a bounded search, tried once
+  // per position and d.
+  bool WithinByBoundedSearch(SearchImpl& h, int d) {
+    const Key key = Mix(Mix(h.pos.key(), static_cast<std::uint64_t>(d)), 23);
+    const auto it = bound_memo.find(key);
+    if (it != bound_memo.end()) return it->second;
+    return bound_memo[key] = BoundedSearch(h, d);
+  }
+
+  // Defender to move: the length of the real defences, -1 when not within
+  // kMaxLengthChain. The longest real defence is made shortest first.
+  int RealLen(SearchImpl& h, Square slider) {
+    const Key key = Mix(Mix(h.pos.key(), slider), 17);
+    const auto it = real_memo.find(key);
+    if (it != real_memo.end()) return it->second;
+    Position& p = h.pos;
+    int len = -1;
+    for (int k = 0; k <= kMaxLengthChain && visits < kBudget; k += 2)
+      if (RealWithin(h, slider, k)) { len = k; break; }
+    if (len > 0) {
+      StateInfo st;
+      for (const Move m : Replies(h)) {
+        if (ChainDrop(p, m, slider) || KnownMated(h, m, st)) continue;
+        p.do_move(m, st);
+        const bool longest = !OrWithin(h, slider, len - 3);
+        if (longest) Shortest(h, len - 1);
+        p.undo_move(m);
+        if (longest) break;
+      }
+    }
+    return real_memo[key] = len;
+  }
+
+  // Interposition r of a chain at the current (defender-to-move) node: futile
+  // when, after its capture, hisshi is reached within `real` plies, the
+  // length of the real defences without r.
+  bool ChainFutile(SearchImpl& h, Move r, Square slider) {
+    Position& p = h.pos;
+    // Shared by every piece dropped on the square and every distribution of
+    // the hands (an approximation: per piece and hand the positions of a
+    // chain grow like a tree).
+    const Key key = Mix(Mix(BoardKey(p) ^ (p.side_to_move() == BLACK ? 0 : 0x5bd1e995ULL), to_sq(r)), slider);
+    const auto it = chain_memo.find(key);
+    if (it != chain_memo.end()) return it->second;
+    ++chain_eval;
+    ++futility_depth;  // positions outside the proof: the smaller re-proof budget
+    // Length-search visits of its own (the answer's length search keeps its own).
+    const std::uint64_t saved_visits = visits;
+    visits = 0;
+    bool futile = false;
+    const int real = RealLen(h, slider);
+    if (real >= 0) {
+      StateInfo s1, s2, s3;
+      p.do_move(r, s1);
+      for (const Move cap : Captures(p, slider, to_sq(r))) {
+        p.do_move(cap, s2);
+        const Square next = to_sq(r);
+        bool within = RealWithin(h, next, real);
+        if (!within) {
+          // The longest real defence after the capture may have a shorter
+          // answer never proven: one bounded search at the needed length.
+          StateInfo s4;
+          for (const Move m : Replies(h)) {
+            if (ChainDrop(p, m, next) || KnownMated(h, m, s4)) continue;
+            p.do_move(m, s4);
+            const bool longer = real < 1 || !OrWithin(h, next, real - 1);
+            if (longer) WithinByBoundedSearch(h, real - 1);
+            p.undo_move(m);
+            if (longer) break;
+          }
+        }
+        // The chain goes on: a later interposition counts unless futile.
+        for (const Move r2 : Replies(h)) {
+          if (!within) break;
+          if (!ChainDrop(p, r2, next)) continue;
+          --chain_eval;
+          const bool f2 = ChainFutile(h, r2, next);
+          ++chain_eval;
+          if (f2) continue;
+          p.do_move(r2, s3);
+          within = real >= 1 && OrWithin(h, next, real - 1);
+          p.undo_move(r2);
+        }
+        p.undo_move(cap);
+        if (within) { futile = true; break; }
+      }
+      p.undo_move(r);
+    }
+    visits = saved_visits;
+    --futility_depth;
+    --chain_eval;
+    return chain_memo[key] = futile;
+  }
+
   // The answer: the attacker reaches hisshi as soon as possible, the defender
   // resists as long as possible, futile interpositions excluded (all among
   // the proven moves). Falls back to a greedy line when the length search
@@ -453,16 +690,38 @@ struct PvBuilder {
     std::vector<Move> pv, first;
     int total = -1;
     bool first_exact = false;
+    bool last_exact = false;
     for (int round = 0;; ++round) {
-      pv = PvOnce(h, total);
+      std::vector<Move> next = PvOnce(h, total);
+      // An answer ends with the attacker's move: a line cut after a defence
+      // (lengths that disagree with the judgements) is not exact.
+      if (exact && next.size() % 2 == 0) exact = false;
+      if (round > 0 && !exact && last_exact) {
+        // The length search failed in a later round: keep the last exact
+        // answer rather than a greedy line.
+        exact = true;
+        break;
+      }
+      pv = std::move(next);
+      last_exact = exact;
       if (round == 0) { first = pv; first_exact = exact; }
-      if (!exact || total <= 1 || round == kShortenRounds || shorten_nodes >= kShortenBudget) break;
-      if (!TryShorterAlong(h, pv, total)) break;
-      // New proofs can only shorten lengths: "within k" stays true, "not
-      // within k" may not. Mate probes are facts (a failed probe stays a
-      // conservative "not known").
-      for (auto& [key, b] : bounds) b.lo = -1;
+      bool more = exact && total > 1 && round < kShortenRounds && shorten_nodes < kShortenBudget;
+      if (chain_restart && exact && round < kShortenRounds) {
+        chain_restart = false;  // rebuild with the shorter proofs copied by the chain judgements
+        more = true;
+      } else if (more) {
+        more = TryShorterAlong(h, pv, total);
+      }
+      if (!more) break;
+      // New proofs can only shorten lengths: without futility "within k"
+      // stays true, "not within k" may not. With futility the judgements
+      // change too: everything is computed again. Mate probes are facts (a
+      // failed probe stays a conservative "not known").
+      if (opt.futile) bounds.clear();
+      else for (auto& [key, b] : bounds) b.lo = -1;
       proven_cache.clear();
+      chain_memo.clear();
+      real_memo.clear();
       visits = 0;
     }
     if (pv != first && !VerifyLine(h, pv)) {
@@ -618,6 +877,7 @@ struct PvBuilder {
         if (shorter) continue;
         if (ReplyMated(h, m, st[ply])) continue;
         if (IsInterposition(p, m, slider) && FutileAtOnce(h, m, slider, 1)) continue;
+        if (ChainDrop(p, m, slider) && ChainFutile(h, m, slider)) continue;
         if (IsInterposition(p, m, slider) && Futile(h, m, slider)) continue;
         chosen = m;
         break;
@@ -683,6 +943,7 @@ struct PvBuilder {
       Move chosen = MOVE_NONE;
       for (const Move m : Replies(h)) {
         if (ReplyMated(h, m, st[ply])) continue;
+        if (ChainDrop(p, m, slider) && ChainFutile(h, m, slider)) continue;
         if (IsInterposition(p, m, slider) && Futile(h, m, slider)) continue;
         chosen = m;
         break;

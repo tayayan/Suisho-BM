@@ -1161,7 +1161,22 @@ struct SearchImpl {
     return NodeResult{pn, dn, len, rep, store_hand};
   }
 
+  // Bounded-length search (answer building): attacker nodes of the hisshi
+  // line at or beyond this ply may only win by checkmate (mate mode), so a
+  // proof shows hisshi within the limit. Disproofs caused by the limit are
+  // marked as path-dependent. 0 = no limit.
+  int hisshi_ply_limit = 0;
+
   NodeResult Search(int ply, std::uint8_t mode, PnDn thpn, PnDn thdn, Move last) {
+    if (hisshi_ply_limit && mode == kModeHisshi && ply >= hisshi_ply_limit && pos.side_to_move() == atk) {
+      NodeResult r = SearchBody(ply, kModeMate, thpn, thdn, last);
+      if (r.dn == 0) r.rep = true;
+      return r;
+    }
+    return SearchBody(ply, mode, thpn, thdn, last);
+  }
+
+  NodeResult SearchBody(int ply, std::uint8_t mode, PnDn thpn, PnDn thdn, Move last) {
     ++nodes;
     if (ply > seldepth) seldepth = ply;
     if (nodes >= next_check) CheckLimits();
@@ -1527,6 +1542,17 @@ struct SearchImpl {
     node_cap = 0;
     stop = saved_stop;
     return r;
+  }
+
+  // Is hisshi reached within d plies (attacker to move, d odd) from the
+  // current position? A proof is stored as an ordinary hisshi proof.
+  bool ShortSearch(int d, std::uint64_t budget) {
+    // The root is searched at ply path.size() + 1 (see SubSearch); its last
+    // attacker move is at root + d - 1.
+    hisshi_ply_limit = static_cast<int>(path.size()) + 1 + d + 1;
+    const NodeResult r = SubSearch(kModeHisshi, budget);
+    hisshi_ply_limit = 0;
+    return r.pn == 0;
   }
 };
 

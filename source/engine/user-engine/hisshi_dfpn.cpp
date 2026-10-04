@@ -959,9 +959,15 @@ struct SearchImpl {
 
   // 1+epsilon trick (Pawlewicz & Lew): let the best child run a little past
   // the second best before returning, which reduces switching between them.
-  PnDn Epsilon(PnDn second) const {
-    if (opt.eps_percent <= 0 || second >= kInf) return second;
-    return Add(second, (second * static_cast<PnDn>(opt.eps_percent) + 99) / 100);
+  // Below a pass (mate mode) at least kMateEps: without it the search
+  // alternates between checks of nearly equal proof numbers and rarely
+  // completes a disproof (no-mate positions stayed undecided for tens of
+  // millions of nodes; with it they are disproved in thousands).
+  static constexpr int kMateEps = 50;
+  PnDn Epsilon(PnDn second, std::uint8_t mode) const {
+    const int eps = mode == kModeMate ? std::max(opt.eps_percent, kMateEps) : opt.eps_percent;
+    if (eps <= 0 || second >= kInf) return second;
+    return Add(second, (second * static_cast<PnDn>(eps) + 99) / 100);
   }
 
   // ---- df-pn+ ---------------------------------------------------------------
@@ -1178,7 +1184,7 @@ struct SearchImpl {
         second_v = std::min(second_v, virt);
         Child& c = ch[best];
         const PnDn sec = second_v > kInf ? kInf : second_v;
-        PnDn cthpn = std::min(thpn, Add(Epsilon(sec), 1));
+        PnDn cthpn = std::min(thpn, Add(Epsilon(sec, mode), 1));
         cthpn = cthpn >= kInf ? kInf : cthpn - c.cost;
         PnDn others = inactive_dn;
         for (int g = 0; g < groups; ++g)
@@ -1234,7 +1240,7 @@ struct SearchImpl {
           }
         }
         const PnDn sec = second_v > kInf ? kInf : second_v;
-        const PnDn cthdn = std::min(thdn, Add(Epsilon(sec), 1));
+        const PnDn cthdn = std::min(thdn, Add(Epsilon(sec, mode), 1));
         PnDn others = inactive_pn;
         for (int g = 0; g < groups; ++g)
           if (g != c.group) others = Add(others, gmax[g]);

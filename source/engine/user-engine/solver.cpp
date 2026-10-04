@@ -43,8 +43,16 @@ int Solver::Hashfull() const {
   if (table_.empty()) return 0;
   int used = 0;
   const std::size_t sample = std::min<std::size_t>(table_.size(), 1000);
-  for (std::size_t i = 0; i < sample; ++i)
+  for (std::size_t i = 0; i < sample; ++i) {
+    // The search threads write the table meanwhile: the cluster's lock (the
+    // same as SearchImpl::ClusterLock's).
+    Lock* l = shared_ ? &locks_[i & (kLocks - 1)] : nullptr;
+    if (l)
+      while (l->v.exchange(1, std::memory_order_acquire))
+        while (l->v.load(std::memory_order_relaxed)) _mm_pause();
     for (int j = 0; j < kClusterSize; ++j) used += table_[i].key[j] != 0;
+    if (l) l->v.store(0, std::memory_order_release);
+  }
   return static_cast<int>(used * 1000 / (sample * kClusterSize));
 }
 

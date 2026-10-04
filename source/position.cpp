@@ -1144,7 +1144,11 @@ void Position::do_move_impl(Move m, StateInfo& new_st, bool givesCheck)
 	ASSERT_LV3(&new_st != st);
 
 	// 探索ノード数 ≒do_move()の呼び出し回数のインクリメント。
+	// Suisho-BM: the hisshi solver counts its own nodes, and all its workers
+	// share one Thread: this shared counter only slows the parallel search.
+#if !defined(USER_ENGINE)
 	thisThread->nodes.fetch_add(1, std::memory_order_relaxed);
+#endif
 
 	//std::cout << *this << m << std::endl;
 

@@ -501,7 +501,14 @@ struct PvBuilder {
   // it in the next round.
   static constexpr std::size_t kShortTableMb = 128;
   static constexpr std::uint64_t kShortCall = 3000000;    // nodes of one bounded search (proofs need ~1M)
-  static constexpr std::uint64_t kShortBudget = 8000000;  // nodes of all bounded searches of one answer
+  static constexpr std::uint64_t kShortBudget = 40000000;  // nodes of all bounded searches of one answer
+  // Nodes of the bounded searches of one chain judgement (with the later
+  // interpositions it judges): each judgement gets its share, so that the
+  // first ones do not leave nothing to the others.
+  static constexpr std::uint64_t kJudgeBudget = 6000000;
+  int chain_depth = 0;           // nested chain judgements
+  std::uint64_t judge_left = 0;  // bounded-search nodes left to the current judgement
+  std::uint64_t last_bs_nodes = 0;
   std::unique_ptr<Solver> short_solver;
   std::unique_ptr<SearchImpl> short_search;
   std::uint64_t short_nodes = 0;
@@ -530,13 +537,18 @@ struct PvBuilder {
 
   // Attacker to move: is hisshi reached within d plies? One bounded search
   // (a proof found is copied into the main table).
-  bool BoundedSearch(SearchImpl& h, int d) {
-    if (d < 1 || short_nodes >= kShortBudget) return false;
+  bool BoundedSearch(SearchImpl& h, int d, std::uint64_t cap = kShortCall) {
+    last_bs_nodes = 0;
+    std::uint64_t budget = std::min(cap, kShortBudget - std::min(short_nodes, kShortBudget));
+    if (chain_depth) budget = std::min(budget, judge_left);
+    if (d < 1 || budget == 0) return false;
     SearchImpl& s2 = ShortSearcher(h);
     short_solver->Clear();
     const std::uint64_t n0 = s2.nodes;
-    const bool ok = s2.ShortSearch(d, std::min(kShortCall, kShortBudget - short_nodes));
-    short_nodes += s2.nodes - n0;
+    const bool ok = s2.ShortSearch(d, budget);
+    last_bs_nodes = s2.nodes - n0;
+    short_nodes += last_bs_nodes;
+    if (chain_depth) judge_left -= std::min(judge_left, last_bs_nodes);
     if (!ok) return false;
     CopyProof(s2, h, d);
     chain_restart = true;
@@ -577,7 +589,13 @@ struct PvBuilder {
     const Key key = Mix(h.pos.key(), 13);
     if (shortest_memo.count(key)) return;
     int best = upper;
-    for (int d = upper - 2; d >= 1 && BoundedSearch(h, d); d -= 2) best = d;
+    // A shorter limit rarely needs much more than the last success: a
+    // failing step (mostly running out of its budget) costs less so.
+    std::uint64_t cap = kShortCall;
+    for (int d = upper - 2; d >= 1 && BoundedSearch(h, d, cap); d -= 2) {
+      best = d;
+      cap = std::min(kShortCall, std::max<std::uint64_t>(4 * last_bs_nodes, 300000));
+    }
     shortest_memo[key] = best;
   }
 
@@ -625,6 +643,7 @@ struct PvBuilder {
     const Key key = Mix(Mix(BoardKey(p) ^ (p.side_to_move() == BLACK ? 0 : 0x5bd1e995ULL), to_sq(r)), slider);
     const auto it = chain_memo.find(key);
     if (it != chain_memo.end()) return it->second;
+    if (chain_depth++ == 0) judge_left = kJudgeBudget;
     ++chain_eval;
     ++futility_depth;  // positions outside the proof: the smaller re-proof budget
     // Length-search visits of its own (the answer's length search keeps its own).
@@ -672,6 +691,7 @@ struct PvBuilder {
     visits = saved_visits;
     --futility_depth;
     --chain_eval;
+    --chain_depth;
     return chain_memo[key] = futile;
   }
 

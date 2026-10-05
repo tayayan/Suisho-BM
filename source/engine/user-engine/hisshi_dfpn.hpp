@@ -10,6 +10,7 @@
 // separate mate engine: a flag in the search path switches move generation.
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -63,10 +64,14 @@ struct Result {
   std::string verify_info;
 };
 
+// The limits hold for the whole Solve: the search, the verification and the
+// answer (every searcher of a Solve counts the time from the same origin,
+// and the nodes of all threads together).
 struct Limits {
   std::uint64_t nodes = 0;       // 0 = unlimited
   std::int64_t time_ms = 0;      // 0 = unlimited
   int pv_interval_ms = 1000;
+  std::chrono::steady_clock::time_point origin{};  // set by Solve: the time counts from here
 };
 
 // Transposition table. An entry takes 24 bytes: a cluster keeps the upper 32
@@ -118,6 +123,8 @@ class Solver {
   void KeepOnlyProofs();
   // TT locking while several threads use the table.
   bool Shared() const { return shared_; }
+  // Nodes of all threads of the current Solve (searchers add theirs as they go).
+  std::uint64_t TotalNodes() const { return total_nodes_.load(std::memory_order_relaxed); }
   void SetShared(bool v) { shared_ = v; }
 
  private:

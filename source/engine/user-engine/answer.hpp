@@ -43,9 +43,7 @@ struct AnswerPool {
         Options wopt = opt;
         wopt.cache_slots = 256;
         wopt.threads = 1;
-        Limits wlim = lim;
-        wlim.time_ms = 0;
-        wlim.nodes = 0;
+        Limits wlim = lim;  // (the limits of the Solve hold here too)
         wlim.pv_interval_ms = 0;
         Position wp;
         StateInfo root_st, st1, st2;
@@ -289,6 +287,14 @@ struct PvBuilder {
   std::uint64_t ReproveBudget() const { return futility_depth ? kReproveFutile : kReprove; }
   std::uint64_t visits = 0;
   bool exact = false;  // the answer came from the exact length search
+  bool limit_reached = false;  // a limit of the Solve: the answer is finished with what is known
+  // The length searches' budget, also spent when a limit of the Solve is
+  // reached (checked now and then).
+  bool OutOfBudget(SearchImpl& h) {
+    if ((visits & 1023) == 0 && !limit_reached && h.LimitReached()) limit_reached = true;
+    if (limit_reached) visits = kBudget;
+    return visits >= kBudget;
+  }
   // Known bounds of a length: "not within lo" and "within hi".
   struct Bounds {
     int lo = -1;
@@ -356,7 +362,7 @@ struct PvBuilder {
     Position& p = h.pos;
     Bounds& bd = bounds[Mix(Mix(p.key(), slider), chain_eval ? 11 : 1)];
     if (k >= bd.hi) return true;
-    if (k <= bd.lo || visits >= kBudget) return false;
+    if (k <= bd.lo || OutOfBudget(h)) return false;
     ++visits;
     const std::vector<std::pair<int, Move>> moves = ProvenMoves(h);
     bool ok = false;
@@ -383,7 +389,7 @@ struct PvBuilder {
     Position& p = h.pos;
     Bounds& bd = bounds[Mix(Mix(p.key(), slider), chain_eval ? 12 : 2)];
     if (k >= bd.hi) return true;
-    if (k <= bd.lo || visits >= kBudget) return false;
+    if (k <= bd.lo || OutOfBudget(h)) return false;
     ++visits;
     bool ok = true;
     StateInfo st;
@@ -514,7 +520,8 @@ struct PvBuilder {
       so.cache_slots = 256;
       so.threads = 1;
       so.eps_percent = std::max(so.eps_percent, 50);  // without it the bounded searches rarely decide
-      Limits sl;
+      Limits sl = h.lim;  // the time limit of the Solve (its own table: no node total)
+      sl.nodes = 0;
       sl.pv_interval_ms = 0;
       short_search = std::make_unique<SearchImpl>(*short_solver, h.pos, so, sl, nullptr, 0, nullptr, atk);
     }
@@ -705,7 +712,8 @@ struct PvBuilder {
       pv = std::move(next);
       last_exact = exact;
       if (round == 0) { first = pv; first_exact = exact; }
-      bool more = exact && total > 1 && round < kShortenRounds && shorten_nodes < kShortenBudget;
+      bool more = exact && total > 1 && round < kShortenRounds && shorten_nodes < kShortenBudget &&
+                  !limit_reached && !h.LimitReached();
       if (chain_restart && exact && round < kShortenRounds) {
         chain_restart = false;  // rebuild with the shorter proofs copied by the chain judgements
         more = true;
@@ -912,6 +920,13 @@ struct PvBuilder {
   // Greedy answer (fallback): shortest proof for the attacker, longest proof
   // for the defender, futile interpositions excluded.
   std::vector<Move> GreedyPv(SearchImpl& h) {
+    // After a limit of the Solve the probes still run (with their own small
+    // budgets): without them the line could stop short of hisshi.
+    struct IgnoreLimits {
+      SearchImpl& s;
+      explicit IgnoreLimits(SearchImpl& x) : s(x) { s.ignore_limits = true; }
+      ~IgnoreLimits() { s.ignore_limits = false; }
+    } ignore_limits(h);
     Position& p = h.pos;
     std::vector<StateInfo> st(1024);
     std::vector<Move> pv;

@@ -260,7 +260,8 @@ std::unique_ptr<AtomicHandSet> VerifyProof(const SolveContext& ctx, SearchImpl& 
 // verification; the shorter-answer attempts use all threads.
 void BuildAnswer(const SolveContext& ctx, SearchImpl& s, AtomicHandSet* verified, Result& res) {
   const auto t0 = s.ElapsedMs();
-  const std::uint64_t n0 = s.nodes;
+  s.FlushNodes();
+  const std::uint64_t n0 = ctx.solver.TotalNodes();
   PvBuilder builder(ctx.solver, ctx.opt, s.atk);
   builder.verified = verified;
   std::unique_ptr<AnswerPool> pool;
@@ -270,10 +271,11 @@ void BuildAnswer(const SolveContext& ctx, SearchImpl& s, AtomicHandSet* verified
     builder.pool = pool.get();
   }
   res.pv = builder.Pv(s);
-  pool.reset();
+  pool.reset();  // (its searchers add their nodes)
+  s.FlushNodes();
   res.verify_info += std::string(" answer=") + (builder.exact ? "longest" : "greedy") +
                      " answer_ms=" + std::to_string(s.ElapsedMs() - t0) +
-                     " answer_nodes=" + std::to_string(s.nodes - n0);
+                     " answer_nodes=" + std::to_string(ctx.solver.TotalNodes() - n0);
 }
 
 }  // namespace
@@ -281,7 +283,10 @@ void BuildAnswer(const SolveContext& ctx, SearchImpl& s, AtomicHandSet* verified
 // ---------------------------------------------------------------------------
 // Solve
 
-Result Solver::Solve(Position& root, const Limits& limits, const Options& opt, bool (*should_stop)()) {
+Result Solver::Solve(Position& root, const Limits& given_limits, const Options& opt, bool (*should_stop)()) {
+  // Every searcher of this Solve counts the time limit from now.
+  Limits limits = given_limits;
+  if (limits.origin == std::chrono::steady_clock::time_point{}) limits.origin = std::chrono::steady_clock::now();
   InitTables();
   if (table_.empty()) Resize(256);
   // A large table takes a noticeable time to clear: only after a search.
@@ -304,7 +309,7 @@ Result Solver::Solve(Position& root, const Limits& limits, const Options& opt, b
   // has decided it.
   std::atomic<bool> done{false};
   std::vector<std::thread> helpers;
-  std::vector<std::uint64_t> helper_nodes(nthreads, 0);
+  total_nodes_ = 0;
   shared_ = nthreads > 1;
   for (int t = 1; t < nthreads; ++t) {
     helpers.emplace_back([&, t]() {
@@ -315,7 +320,6 @@ Result Solver::Solve(Position& root, const Limits& limits, const Options& opt, b
       hlim.pv_interval_ms = 0;
       SearchImpl h(*this, hp, HelperOptions(opt, t, helper_slots), hlim, should_stop, t, &done);
       const NodeResult hr = h.Run(kModeHisshi);
-      helper_nodes[t] = h.nodes;
       if (hr.pn == 0 || hr.dn == 0) done = true;
     });
   }
@@ -325,7 +329,6 @@ Result Solver::Solve(Position& root, const Limits& limits, const Options& opt, b
   Options main_opt = opt;
   if (nthreads == 1 && main_opt.eps_percent == 0) main_opt.eps_percent = opt.single_thread_eps;
   main_opt.cache_slots = main_slots;
-  total_nodes_ = 0;
   SearchImpl s(*this, root, main_opt, limits, should_stop, 0, nthreads > 1 ? &done : nullptr);
   s.report = true;
   s.root_sfen = ctx.root_sfen;
@@ -345,8 +348,8 @@ Result Solver::Solve(Position& root, const Limits& limits, const Options& opt, b
   }
   res.pn = r.pn;
   res.dn = r.dn;
-  res.nodes = s.nodes;
-  for (std::uint64_t hn : helper_nodes) res.nodes += hn;
+  s.FlushNodes();  // (the helpers added theirs when they ended)
+  res.nodes = TotalNodes();
   res.elapsed_ms = s.ElapsedMs();
   if (r.pn == 0) {
     res.status = Status::kProven;
@@ -361,13 +364,18 @@ Result Solver::Solve(Position& root, const Limits& limits, const Options& opt, b
     sync_cout << "info string proof found (" << s.ElapsedMs() << " ms), verifying" << sync_endl;
   if (Hashfull() > 300) KeepOnlyProofs();  // a full scan: only when the table is in use
   const std::unique_ptr<AtomicHandSet> verified = VerifyProof(ctx, s, res);
+  // A verification cut off by a limit (time, nodes, stop) is not a failed one.
+  const bool cut_off = !res.verified && s.LimitReached();
+  if (cut_off) res.verify_info += " stopped=limit";
   if (limits.pv_interval_ms > 0)
-    sync_cout << "info string proof " << (res.verified ? "verified" : "NOT verified") << " (" << s.ElapsedMs()
-              << " ms), building the answer" << sync_endl;
-  BuildAnswer(ctx, s, verified.get(), res);
+    sync_cout << "info string proof "
+              << (res.verified ? "verified" : cut_off ? "verification stopped by the limit" : "NOT verified") << " ("
+              << s.ElapsedMs() << " ms)" << (res.verified ? ", building the answer" : "") << sync_endl;
+  // An unverified proof is not reported (no answer is shown for it).
+  if (res.verified) BuildAnswer(ctx, s, verified.get(), res);
 
-  res.nodes = s.nodes;
-  for (std::uint64_t hn : helper_nodes) res.nodes += hn;
+  s.FlushNodes();  // (the verification and answer threads added theirs)
+  res.nodes = TotalNodes();
   res.elapsed_ms = s.ElapsedMs();
   return res;
 }

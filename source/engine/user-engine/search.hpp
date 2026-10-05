@@ -264,8 +264,10 @@ struct SearchImpl {
     // child_buf / full_buf of a ply are allocated when the ply is first
     // reached (most searches stay far below max_ply).
     states.resize(opt.max_ply + 8);
-    start = std::chrono::steady_clock::now();
+    start = lim.origin == std::chrono::steady_clock::time_point{} ? std::chrono::steady_clock::now() : lim.origin;
   }
+
+  ~SearchImpl() { FlushNodes(); }
 
   std::uint64_t ElapsedMs() const {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -309,8 +311,19 @@ struct SearchImpl {
     const std::uint16_t lo = TagLo(board);
     PnDn pn_lb = 1, dn_lb = 1;
     int disproof = -1;  // a proof takes precedence (disproofs may depend on the path)
-    for (int i = 0; i < kClusterSize; ++i) {
-      if (c->key[i] != hi || c->d[i].tag != lo) continue;
+    // The slots whose upper key bits match (all eight compared at once).
+    unsigned hits = 0;
+#if defined(USE_AVX2)
+    const __m256i keys = _mm256_load_si256(reinterpret_cast<const __m256i*>(c->key));
+    const __m256i eq = _mm256_cmpeq_epi32(keys, _mm256_set1_epi32(static_cast<int>(hi)));
+    hits = static_cast<unsigned>(_mm256_movemask_ps(_mm256_castsi256_ps(eq)));
+#else
+    for (int j = 0; j < kClusterSize; ++j)
+      if (c->key[j] == hi) hits |= 1u << j;
+#endif
+    for (; hits; hits &= hits - 1) {
+      const int i = __builtin_ctz(hits);
+      if (c->d[i].tag != lo) continue;
       const EntryData& e = c->d[i];
       const Hand eh = static_cast<Hand>(e.hand);
       const bool we_sup = hand_is_equal_or_superior(hand, eh);  // our hand >= entry hand
@@ -559,20 +572,43 @@ struct SearchImpl {
     return kGOther;
   }
 
+  // Orders children by stage (0, 1, 2), keeping the order within a stage
+  // (a stable counting sort).
+  static void SortByStage(Child* first, Child* last) {
+    const int n = static_cast<int>(last - first);
+    if (n < 2) return;
+    int counts[3] = {0, 0, 0};
+    bool sorted = true;
+    for (int i = 0; i < n; ++i) {
+      ++counts[first[i].stage];
+      if (i && first[i - 1].stage > first[i].stage) sorted = false;
+    }
+    if (sorted) return;
+    static thread_local Child scratch[kMaxChildren];
+    int next[3] = {0, counts[0], counts[0] + counts[1]};
+    for (int i = 0; i < n; ++i) scratch[next[first[i].stage]++] = first[i];
+    std::copy(scratch, scratch + n, first);
+  }
+
   // Generates the non-checking attacks of a lazily expanded OR node
   // (appended as stage 1).
   void ExpandLazy(ChildList& ch, int& groups) {
     static thread_local int key_to_group[256];
     std::fill(std::begin(key_to_group), std::end(key_to_group), -1);
     const std::size_t n0 = ch.size();
+    // The non-checking attacks already there (the killer): the only possible
+    // duplicates of the attacks generated here.
+    Move present[4];
+    int npresent = 0;
+    for (std::size_t i = 0; i < n0 && npresent < 4; ++i)
+      if (!ch[i].check) present[npresent++] = ch[i].move;
     for (const auto& em : MoveList<NON_EVASIONS_ALL>(pos)) {
       const Move m = em.move;
-      if (UselessNonPromotion(pos, m)) continue;
-      if (!opt.full_width && !IsCandidate(m)) continue;
+      if (!opt.full_width && (UselessNonPromotion(pos, m) || !IsCandidate(m))) continue;
       if (pos.gives_check(m) || !pos.legal(m)) continue;
       bool dup = false;
-      for (std::size_t i = 0; i < n0; ++i)
-        if (ch[i].move == m) { dup = true; break; }
+      for (int i = 0; i < npresent; ++i)
+        if (present[i] == m) { dup = true; break; }
       if (dup) continue;
       Child c{};
       c.move = m;
@@ -629,8 +665,7 @@ struct SearchImpl {
       }
       ch.push_back(c);
     }
-    std::stable_sort(ch.begin() + n0, ch.end(),
-                     [](const Child& x, const Child& y) { return x.stage < y.stage; });
+    SortByStage(ch.begin() + n0, ch.end());
     int b2 = static_cast<int>(ch.size());
     for (std::size_t i = n0; i < ch.size(); ++i)
       if (ch[i].stage == 2) { b2 = static_cast<int>(i); break; }
@@ -769,8 +804,7 @@ struct SearchImpl {
     }
 
     // Order by stage and compute the stage boundaries / estimates.
-    std::stable_sort(ch.begin(), ch.end(),
-                     [](const Child& x, const Child& y) { return x.stage < y.stage; });
+    SortByStage(ch.begin(), ch.end());
     si = StageInfo{};
     int last_stage = -1;
     static thread_local std::vector<std::uint8_t> seen_group;
@@ -821,12 +855,35 @@ struct SearchImpl {
     }
   }
 
-  void CheckLimits() {
-    next_check = nodes + 4096;
+  // Adds this searcher's nodes since the last call to the solver's total
+  // (all threads of all phases).
+  void FlushNodes() {
     solver.total_nodes_.fetch_add(nodes - nodes_reported, std::memory_order_relaxed);
     nodes_reported = nodes;
+  }
+
+  // Sub-searches with a budget of their own run on past the limits of the
+  // Solve (the greedy answer after a limit: its mate probes are small).
+  bool ignore_limits = false;
+
+  // A limit of the Solve (time, nodes of all threads) is reached, or a stop
+  // was requested.
+  bool LimitReached() const {
+    return (lim.time_ms && static_cast<std::int64_t>(ElapsedMs()) >= lim.time_ms) ||
+           (lim.nodes && solver.total_nodes_.load(std::memory_order_relaxed) >= lim.nodes) ||
+           (should_stop && should_stop());
+  }
+
+  void CheckLimits() {
+    next_check = nodes + 4096;
+    FlushNodes();
     const auto ms = ElapsedMs();
-    if ((node_cap && nodes >= node_cap) || (lim.nodes && nodes >= lim.nodes) || (lim.time_ms && static_cast<std::int64_t>(ms) >= lim.time_ms) ||
+    // The node limit counts the nodes of all threads.
+    const bool node_limit = lim.nodes && solver.total_nodes_.load(std::memory_order_relaxed) >= lim.nodes;
+    if (ignore_limits) {
+      // Only the budget of the current sub-search (see ignore_limits).
+      if (node_cap && nodes >= node_cap) stop = true;
+    } else if ((node_cap && nodes >= node_cap) || node_limit || (lim.time_ms && static_cast<std::int64_t>(ms) >= lim.time_ms) ||
         (should_stop && should_stop()) || (shared_stop && shared_stop->load(std::memory_order_relaxed)))
       stop = true;
     if (report && lim.pv_interval_ms > 0 && ms >= next_report_ms) {
@@ -1275,10 +1332,9 @@ struct SearchImpl {
         const PnDn sec = second_v > kInf ? kInf : second_v;
         PnDn cthpn = std::min(thpn, Add(Epsilon(sec, mode), 1));
         cthpn = cthpn >= kInf ? kInf : cthpn - c.cost;
-        PnDn others = inactive_dn;
-        for (int g = 0; g < w.groups; ++g)
-          if (g != c.group) others = Add(others, gmax[g]);
-        const PnDn cthdn = thdn >= kInf ? kInf : thdn - others;
+        // The other groups' sum: dn without this group (dn < thdn < kInf here,
+        // so the sum was not saturated).
+        const PnDn cthdn = thdn >= kInf ? kInf : thdn - (dn - gmax[c.group]);
         SearchChild(ply, mode, c, cthpn, cthdn);
         if (c.pn == 0) killers[ply] = c.move;
       } else {
@@ -1315,10 +1371,8 @@ struct SearchImpl {
         if (TryReplay(w, c, mode)) continue;
         const PnDn sec = second_v > kInf ? kInf : second_v;
         const PnDn cthdn = std::min(thdn, Add(Epsilon(sec, mode), 1));
-        PnDn others = inactive_pn;
-        for (int g = 0; g < w.groups; ++g)
-          if (g != c.group) others = Add(others, gmax[g]);
-        const PnDn cthpn = thpn >= kInf ? kInf : thpn - others;
+        // (likewise: pn < thpn < kInf here)
+        const PnDn cthpn = thpn >= kInf ? kInf : thpn - (pn - gmax[c.group]);
         SearchChild(ply, mode, c, cthpn, cthdn);
       }
     }

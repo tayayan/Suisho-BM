@@ -302,9 +302,12 @@ struct SearchImpl {
     }
   };
 
-  Probe Lookup(Key board, Hand hand, std::uint8_t mode) {
+  // `path_key` (0: none) is the path of the looked-up position: a disproof
+  // resting on a repetition is returned only for the path it was found on.
+  Probe Lookup(Key board, Hand hand, std::uint8_t mode, Key path_key = 0) {
     board = NonZero(board);
     Probe r;
+    bool possible_rep = false;
     Cluster* c = GetCluster(board);
     ClusterLock lock(solver, board);
     const std::uint32_t hi = TagHi(board);
@@ -340,6 +343,7 @@ struct SearchImpl {
       if (e.Mode() == mode && eh == hand) {
         r.found = true;
         r.pn = FromTT(e.pn); r.dn = FromTT(e.dn); r.len = e.Len(); r.best = e.best;
+        possible_rep = e.Rep();
         continue;
       }
       // Superiority gives lower bounds on the unknown values.
@@ -351,6 +355,10 @@ struct SearchImpl {
     if (disproof >= 0) {
       const EntryData& e = c->d[disproof];
       r.pn = kInf; r.dn = 0; r.len = e.Len(); r.best = e.best; r.found = true; r.rep = e.Rep();
+      return r;
+    }
+    if (possible_rep && solver.RepContains(path_key)) {
+      r.pn = kInf; r.dn = 0; r.len = 0; r.found = true; r.rep = true;
       return r;
     }
     if (r.found) {
@@ -377,6 +385,21 @@ struct SearchImpl {
         target = i;
         break;
       }
+    }
+    if (dn == 0 && rep && !hisshi_ply_limit) {
+      // A disproof resting on a repetition with the path (its path key is
+      // in the solver's repetition table, see Conclude): the entry keeps its
+      // estimates for the other paths and only gets the flag (a new entry
+      // starts from unit estimates).
+      if (target >= 0) {
+        EntryData& t = c->d[target];
+        if (t.pn != 0 && t.dn != 0) t.lmr = static_cast<std::uint16_t>(t.lmr | 0x8000);
+        return;
+      }
+      pn = 1;
+      dn = 1;
+    } else if (target >= 0 && pn != 0 && dn != 0 && c->d[target].Rep() && c->d[target].dn != 0) {
+      rep = true;  // a new estimate keeps the flag of the path-dependent disproofs
     }
     if (target >= 0) {
       // A final result is never replaced by an estimate (another path or
@@ -465,12 +488,28 @@ struct SearchImpl {
   }
   void PushPath(Key k) {
     path.push_back(k);
+    path_keys.push_back(PathMix(path_keys.empty() ? 0 : path_keys.back(), k));
     ++path_count[k & 0xffff];
   }
   void PopPath() {
     --path_count[path.back() & 0xffff];
     path.pop_back();
+    path_keys.pop_back();
   }
+
+  // Path keys: a hash of the whole sequence of positions of the path (from
+  // its first position), so that a disproof resting on a repetition is
+  // reused only on the same path. path_keys[i] covers path[0..i].
+  std::vector<Key> path_keys;
+  static Key PathMix(Key h, Key k) {
+    std::uint64_t x = static_cast<std::uint64_t>(h) ^ (static_cast<std::uint64_t>(k) + 0x9E3779B97F4A7C15ULL);
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+    x ^= x >> 31;
+    return static_cast<Key>(x ? x : 1);
+  }
+  Key CurrentPathKey() const { return path_keys.empty() ? 0 : path_keys.back(); }
+  Key ChildPathKey(Key full) const { return PathMix(CurrentPathKey(), full); }
 
   // ---- move generation ----------------------------------------------------
   static bool UselessNonPromotion(const Position& p, Move m) {
@@ -1060,7 +1099,7 @@ struct SearchImpl {
         if (!c.rep) continue;
         ChildKeyInfo k;
         ChildKey(c, mode, k.board, k.hand, k.mode, k.full);
-        const Probe p = Lookup(k.board, k.hand, k.mode);
+        const Probe p = Lookup(k.board, k.hand, k.mode, ChildPathKey(k.full));
         c.pn = p.pn; c.dn = p.dn; c.len = p.len; c.rep = p.rep; c.ph = p.ph;
       }
     } else {
@@ -1109,7 +1148,7 @@ struct SearchImpl {
         c.pn = kInf; c.dn = 0; c.rep = 1;
         continue;
       }
-      const Probe p = Lookup(k.board, k.hand, k.mode);
+      const Probe p = Lookup(k.board, k.hand, k.mode, ChildPathKey(k.full));
       c.pn = p.pn;
       c.dn = p.dn;
       if (!p.found && opt.deep_pn > 0) {
@@ -1214,6 +1253,10 @@ struct SearchImpl {
     } else if (best >= 0) {
       best_move = ch[best].move;
     }
+    // (In a bounded-length search the disproofs caused by the limit depend on
+    // the plies left rather than on the path: they stay ordinary entries of
+    // that search's own table, as before.)
+    if (dn == 0 && rep && !hisshi_ply_limit) solver.RepInsert(CurrentPathKey());
     Store(board, store_hand, mode, pn, dn, len, best_move, rep, effort);
     return NodeResult{pn, dn, len, rep, store_hand};
   }
@@ -1246,7 +1289,7 @@ struct SearchImpl {
 
     // The node's own TT entry: return at once when it is already decided or
     // above the thresholds (e.g. values changed through a transposition).
-    const Probe self = Lookup(board, hand, mode);
+    const Probe self = Lookup(board, hand, mode, CurrentPathKey());
     if (self.pn == 0 || self.dn == 0 || self.pn >= thpn || self.dn >= thdn)
       return NodeResult{self.pn, self.dn, self.len, self.rep, self.pn == 0 ? self.ph : hand};
 

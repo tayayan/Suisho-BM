@@ -26,6 +26,7 @@ void Solver::Resize(std::size_t mb) {
 
 void Solver::Clear() {
   if (!table_.empty()) std::memset(static_cast<void*>(table_.data()), 0, table_.size() * sizeof(Cluster));
+  for (std::size_t i = 0; i < kRepTableSize; ++i) rep_table_[i].store(0, std::memory_order_relaxed);
   dirty_ = false;
 }
 
@@ -353,9 +354,12 @@ Result Solver::Solve(Position& root, const Limits& given_limits, const Options& 
   res.elapsed_ms = s.ElapsedMs();
   if (r.pn == 0) {
     res.status = Status::kProven;
-  } else if (r.dn == 0 && !r.rep) {
+  } else if (r.dn == 0) {
+    // A disproof resting on a repetition with the root's path: the
+    // independent check (its path starts at the root) decides.
     res.status = Status::kDisproven;
     VerifyDisproof(s, root, res);
+    if (r.rep) res.verify_info += " rep=1";
   }
   if (res.status != Status::kProven) return res;
 

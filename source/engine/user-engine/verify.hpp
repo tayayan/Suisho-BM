@@ -170,7 +170,7 @@ struct Verifier {
     }
     const std::uint64_t visited_before = visited++;
     on_path.push_back(k);
-    raw_path.push_back(pos.key());
+    raw_path.push_back(s.PathEntry(pos.key(), mode));
     bool ok = true;
     if (pos.side_to_move() == s.atk) {
       ok = VerifyOr(depth, mode);
@@ -350,7 +350,9 @@ struct DisproofVerifier {
       const Move m = em.move;
       if (mode == kModeMate && !pos.gives_check(m)) continue;
       pos.do_move(m, st[depth]);
+      s.PushPath(s.PathEntry(pos.key(), mode));
       const bool ok = Refuted(depth + 1, mode, cyc);
+      s.PopPath();
       pos.undo_move(m);
       if (!ok) {
         if (error.empty()) error = "attack " + to_usi_string(m) + " not refuted";
@@ -361,11 +363,28 @@ struct DisproofVerifier {
   }
 
   // Probe of a defender's reply (MOVE_NULL = the pass).
+  // The reply's TT result for this path (the searcher's path is the
+  // verification path, so disproofs resting on a repetition with it count).
   Probe ProbeReply(Move r, std::uint8_t mode) {
-    if (r == MOVE_NULL) return s.Lookup(BoardKey(pos) ^ s.side_key, pos.hand_of(s.atk), kModeMate);
     Child c{};
     c.move = r;
-    return s.ProbeChild(c, mode);
+    c.pass = r == MOVE_NULL;
+    Key board, full;
+    Hand hand;
+    std::uint8_t cmode;
+    s.ChildKey(c, mode, board, hand, cmode, full);
+    return s.Lookup(board, hand, cmode, s.ChildPathKey(full));
+  }
+
+  bool ReplyOnPath(Move r, std::uint8_t mode) {
+    Child c{};
+    c.move = r;
+    c.pass = r == MOVE_NULL;
+    Key board, full;
+    Hand hand;
+    std::uint8_t cmode;
+    s.ChildKey(c, mode, board, hand, cmode, full);
+    return s.InPath(full);
   }
 
   bool TryReply(int depth, std::uint8_t mode, Move r, bool& cyc) {
@@ -373,11 +392,15 @@ struct DisproofVerifier {
     bool ok;
     if (r == MOVE_NULL) {
       pos.do_null_move(st[depth]);
+      s.PushPath(s.PathEntry(pos.key(), kModeMate));
       ok = Refuted(depth + 1, kModeMate, c);
+      s.PopPath();
       pos.undo_null_move();
     } else {
       pos.do_move(r, st[depth]);
+      s.PushPath(s.PathEntry(pos.key(), mode));
       ok = Refuted(depth + 1, mode, c);
+      s.PopPath();
       pos.undo_move(r);
     }
     if (ok) cyc |= c;
@@ -398,7 +421,10 @@ struct DisproofVerifier {
       for (Move r : replies) {
         if (std::find(tried.begin(), tried.end(), r) != tried.end()) continue;
         const Probe p = ProbeReply(r, mode);
+        // A reply back to a position of the path is a repetition (the search
+        // does not store those): the verification sees it on its own path.
         if (p.dn == 0) cands.emplace_back(p.rep ? 1 : 0, r);
+        else if (ReplyOnPath(r, mode)) cands.emplace_back(1, r);
       }
       std::stable_sort(cands.begin(), cands.end(),
                        [](const auto& a, const auto& b) { return a.first < b.first; });
@@ -413,10 +439,18 @@ struct DisproofVerifier {
       if (round == 1) break;
       // Search this node again to find (another) disproof.
       ++searches;
+      // (SubSearch puts this node on the path itself: off the path meanwhile,
+      // so that its path keys are the verification path's)
+      const Key self = s.path.back();
+      s.PopPath();
+      s.rederive_root = true;
+      s.rederive_ply = static_cast<int>(s.path.size()) + 1;  // (SubSearch's root ply)
       const NodeResult nr = s.SubSearch(mode, kBudget);
+      s.rederive_root = false;
+      s.PushPath(self);
       if (nr.dn != 0) break;
     }
-    if (error.empty()) error = "no refuting reply";
+    if (error.empty()) error = "no refuting reply at " + pos.sfen();
     return false;
   }
 };

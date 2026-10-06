@@ -309,6 +309,7 @@ Result Solver::Solve(Position& root, const Limits& given_limits, const Options& 
   // Helper threads search the same root with a shared TT, until any thread
   // has decided it.
   std::atomic<bool> done{false};
+  std::atomic<bool> helper_rep_disproof{false};  // a helper's root: a disproof resting on a repetition
   std::vector<std::thread> helpers;
   total_nodes_ = 0;
   shared_ = nthreads > 1;
@@ -321,6 +322,7 @@ Result Solver::Solve(Position& root, const Limits& given_limits, const Options& 
       hlim.pv_interval_ms = 0;
       SearchImpl h(*this, hp, HelperOptions(opt, t, helper_slots), hlim, should_stop, t, &done);
       const NodeResult hr = h.Run(kModeHisshi);
+      if (hr.dn == 0 && hr.rep) helper_rep_disproof = true;
       if (hr.pn == 0 || hr.dn == 0) done = true;
     });
   }
@@ -345,6 +347,12 @@ Result Solver::Solve(Position& root, const Limits& given_limits, const Options& 
       r.pn = rp.pn;
       r.dn = rp.dn;
       r.rep = false;
+    } else if (r.pn != 0 && r.dn != 0 && helper_rep_disproof) {
+      // A helper disproved the root through a repetition (not in the TT for
+      // the root's own path lookup): the independent check decides.
+      r.pn = kInf;
+      r.dn = 0;
+      r.rep = true;
     }
   }
   res.pn = r.pn;

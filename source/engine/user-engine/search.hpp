@@ -329,6 +329,9 @@ struct SearchImpl {
       if (c->d[i].tag != lo) continue;
       const EntryData& e = c->d[i];
       const Hand eh = static_cast<Hand>(e.hand);
+      // A flag of a path-dependent disproof (stored with the disproof's
+      // hand): the repetition table decides for this path.
+      if (e.Rep() && e.dn != 0 && e.Mode() == mode) possible_rep = true;
       const bool we_sup = hand_is_equal_or_superior(hand, eh);  // our hand >= entry hand
       const bool we_inf = hand_is_equal_or_superior(eh, hand);  // entry hand >= our hand
       if (e.pn == 0 && we_sup && (e.Mode() == mode || (mode == kModeHisshi && e.Mode() == kModeMate))) {
@@ -343,7 +346,6 @@ struct SearchImpl {
       if (e.Mode() == mode && eh == hand) {
         r.found = true;
         r.pn = FromTT(e.pn); r.dn = FromTT(e.dn); r.len = e.Len(); r.best = e.best;
-        possible_rep = e.Rep();
         continue;
       }
       // Superiority gives lower bounds on the unknown values.
@@ -509,6 +511,15 @@ struct SearchImpl {
     return static_cast<Key>(x ? x : 1);
   }
   Key CurrentPathKey() const { return path_keys.empty() ? 0 : path_keys.back(); }
+  // A position on the path, with its mode: a position below a pass (mate
+  // mode) is not a repetition of the same position searched for hisshi
+  // (the pass is no real move), as in the verification.
+  static constexpr Key kMateSalt = 0x5D588B656C078965ULL;
+  static Key PathEntry(Key k, std::uint8_t mode) { return mode == kModeMate ? k ^ kMateSalt : k; }
+  // The disproof verification's re-search of a node: its own path-dependent
+  // disproof is derived again rather than read (see SearchBody).
+  bool rederive_root = false;
+  int rederive_ply = -1;
   Key ChildPathKey(Key full) const { return PathMix(CurrentPathKey(), full); }
 
   // ---- move generation ----------------------------------------------------
@@ -877,11 +888,11 @@ struct SearchImpl {
       board = BoardKey(pos) ^ side_key;
       hand = pos.hand_of(atk);
       cmode = kModeMate;
-      full = pos.key() ^ side_key;
+      full = PathEntry(pos.key() ^ side_key, kModeMate);
       return;
     }
     board = pos.board_key_after(c.move);
-    full = pos.key_after(c.move);
+    full = PathEntry(pos.key_after(c.move), mode);
     hand = pos.hand_of(atk);
     cmode = mode;
     if (pos.side_to_move() == atk) {
@@ -1256,6 +1267,9 @@ struct SearchImpl {
     // (In a bounded-length search the disproofs caused by the limit depend on
     // the plies left rather than on the path: they stay ordinary entries of
     // that search's own table, as before.)
+    // A disproof contradicted by a proof in the TT (for a hand this one
+    // dominates; Store would drop it) holds only through this path.
+    if (dn == 0 && !rep && Lookup(board, store_hand, mode).pn == 0) rep = true;
     if (dn == 0 && rep && !hisshi_ply_limit) solver.RepInsert(CurrentPathKey());
     Store(board, store_hand, mode, pn, dn, len, best_move, rep, effort);
     return NodeResult{pn, dn, len, rep, store_hand};
@@ -1289,7 +1303,15 @@ struct SearchImpl {
 
     // The node's own TT entry: return at once when it is already decided or
     // above the thresholds (e.g. values changed through a transposition).
-    const Probe self = Lookup(board, hand, mode, CurrentPathKey());
+    Probe self = Lookup(board, hand, mode, CurrentPathKey());
+    if (rederive_root && ply == rederive_ply && self.dn == 0) {
+      // (the disproof verification re-searching this node: derive the
+      // disproof again from the children, whose entries may have been
+      // replaced or hold only for another path)
+      self.pn = 1;
+      self.dn = 1;
+      self.rep = false;
+    }
     if (self.pn == 0 || self.dn == 0 || self.pn >= thpn || self.dn >= thdn)
       return NodeResult{self.pn, self.dn, self.len, self.rep, self.pn == 0 ? self.ph : hand};
 
@@ -1433,7 +1455,7 @@ struct SearchImpl {
     } else {
       pos.do_move(m, st);
     }
-    PushPath(pos.key());
+    PushPath(PathEntry(pos.key(), cmode));
     const NodeResult r = Search(ply + 1, cmode, thpn, thdn, c.pass ? MOVE_NONE : m);
     PopPath();
     if (c.pass) pos.undo_null_move();
@@ -1602,7 +1624,7 @@ struct SearchImpl {
 
   // Root search loop.
   NodeResult Run(std::uint8_t mode) {
-    PushPath(pos.key());
+    PushPath(PathEntry(pos.key(), mode));
     NodeResult r{1, 1, 0, false, static_cast<Hand>(0)};
     while (!stop) {
       r = Search(0, mode, kInf, kInf, MOVE_NONE);
@@ -1630,7 +1652,7 @@ struct SearchImpl {
     stop = false;
     node_cap = nodes + budget;
     next_check = nodes;  // re-evaluate limits immediately
-    PushPath(pos.key());
+    PushPath(PathEntry(pos.key(), mode));
     while (!stop) {
       r = Search(static_cast<int>(path.size()), mode, kInf, kInf, MOVE_NONE);
       if (r.pn == 0 || r.dn == 0) break;

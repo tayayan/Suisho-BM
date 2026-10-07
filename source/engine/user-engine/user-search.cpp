@@ -88,6 +88,7 @@ void MainThread::search() {
   sync_cout << "info time " << res.elapsed_ms << " nodes " << res.nodes << " nps " << nps
             << " hashfull " << g_solver.Hashfull() << " string pn=" << ToString(res.pn)
             << " dn=" << ToString(res.dn) << sync_endl;
+  sync_cout << "info string stats " << g_solver.StatsString() << sync_endl;  // (search, checks and answer together)
   if (res.status != hisshi::Status::kProven && !res.verify_info.empty())
     sync_cout << "info string disproof_verified=" << (res.verified ? 1 : 0) << " " << res.verify_info << sync_endl;
   if (res.status == hisshi::Status::kProven) {

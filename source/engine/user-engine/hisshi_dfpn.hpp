@@ -125,6 +125,12 @@ class Solver {
   bool Shared() const { return shared_; }
   // Nodes of all threads of the current Solve (searchers add theirs as they go).
   std::uint64_t TotalNodes() const { return total_nodes_.load(std::memory_order_relaxed); }
+  // Counters of all threads of the current Solve, for the output:
+  // "new=" nodes searched without a TT entry, "tt_return=" nodes left at once
+  // on their TT entry (decided, or beyond the thresholds), "clamp32=" stores
+  // whose finite pn or dn was cut to the TT's 32 bits, "sat=" stores of an
+  // undecided pn or dn saturated at kInf - 1.
+  std::string StatsString() const;
   void SetShared(bool v) { shared_ = v; }
 
  private:
@@ -140,6 +146,7 @@ class Solver {
   std::unique_ptr<Lock[]> locks_{new Lock[kLocks]};
   bool shared_ = false;  // true while helper threads run
   std::atomic<std::uint64_t> total_nodes_{0};  // nodes of all search threads (progress output)
+  std::atomic<std::uint64_t> stat_new_{0}, stat_tt_return_{0}, stat_clamp32_{0}, stat_sat_{0};  // (StatsString)
   bool dirty_ = false;   // the table holds entries of a search
 
   // Disproofs resting on a repetition with the path (the GHI problem): the

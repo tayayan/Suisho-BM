@@ -286,6 +286,8 @@ struct SearchImpl {
 
   // ---- TT ----------------------------------------------------------------
   static constexpr std::uint64_t kFinalWeight = 1000;
+  static constexpr std::uint16_t kFullWidthDisproof = 1;  // length field of a full-width disproof (else 0)
+  static constexpr PnDn kHintPn = 100;                    // pn of a hint (Lookup, force_full_width)
   static Key NonZero(Key board) { return board ? board : 1; }
   // The key bits kept in an entry (with the cluster index they identify the board).
   static std::uint32_t TagHi(Key board) {
@@ -318,6 +320,7 @@ struct SearchImpl {
     board = NonZero(board);
     Probe r;
     bool possible_rep = false;
+    bool hint = false;  // a disproof of the candidates only (force_full_width)
     Cluster* c = GetCluster(board);
     ClusterLock lock(solver, board);
     const std::uint32_t hi = TagHi(board);
@@ -350,6 +353,10 @@ struct SearchImpl {
         return r;
       }
       if (e.dn == 0 && we_inf && (e.Mode() == mode || (mode == kModeMate && e.Mode() == kModeHisshi))) {
+        if (force_full_width && e.Len() != kFullWidthDisproof) {
+          hint = true;  // (found with the candidates only)
+          continue;
+        }
         if (disproof < 0 || (c->d[disproof].Rep() && !e.Rep())) disproof = i;
         continue;
       }
@@ -369,8 +376,13 @@ struct SearchImpl {
       r.pn = kInf; r.dn = 0; r.len = e.Len(); r.best = e.best; r.found = true; r.rep = e.Rep();
       return r;
     }
-    if (possible_rep && solver.RepContains(path_key)) {
+    if (possible_rep && solver.RepContains(RepKey(path_key))) {
       r.pn = kInf; r.dn = 0; r.len = 0; r.found = true; r.rep = true;
+      return r;
+    }
+    if (hint && !r.found) {
+      // Disproven with the candidates only: probably disproven, worth trying first.
+      r.pn = kHintPn; r.dn = 1; r.found = true;
       return r;
     }
     if (r.found) {
@@ -470,6 +482,9 @@ struct SearchImpl {
     c->key[target] = hi;
     e.tag = lo;
     e.hand = static_cast<std::uint32_t>(hand);
+    if (dn == 0) len = FullWidth() ? kFullWidthDisproof : 0;  // (a disproof's length field: its width)
+    if ((pn < kInf && pn >= kTTInf - 1) || (dn < kInf && dn >= kTTInf - 1)) ++stat_clamp32;
+    if (pn == kInf - 1 || dn == kInf - 1) ++stat_sat;
     e.pn = ToTT(pn);
     e.dn = ToTT(dn);
     e.lmr = static_cast<std::uint16_t>(std::min<int>(len, 0x3fff) | ((mode & 1) << 14) | ((rep ? 1 : 0) << 15));
@@ -528,11 +543,22 @@ struct SearchImpl {
   static Key PathEntry(Key k, std::uint8_t mode) { return mode == kModeMate ? k ^ kMateSalt : k; }
   // The disproof verification's re-search of a node: its own path-dependent
   // disproof is derived again rather than read (see SearchBody).
+  // Full width forced on a candidate search (the disproof check's
+  // re-searches): every legal attack is generated, and the disproofs found
+  // with the candidates only are no results, only hints (see Lookup).
+  bool force_full_width = false;
+  bool FullWidth() const { return opt.full_width || force_full_width; }
+  // The repetition table keeps the disproofs of full-width searches apart.
+  static constexpr Key kFullWidthRepSalt = 0x2545F4914F6CDD1DULL;
+  Key RepKey(Key path_key) const { return path_key && FullWidth() ? path_key ^ kFullWidthRepSalt : path_key; }
   bool rederive_root = false;
   int rederive_ply = -1;
   Key ChildPathKey(Key full) const { return PathMix(CurrentPathKey(), full); }
   // Is the position at this path key disproven through a repetition with its path?
-  bool RepAt(Key path_key) const { return solver.RepContains(path_key); }
+  // (either kind: the disproof check takes them as hints)
+  bool RepAt(Key path_key) const {
+    return solver.RepContains(path_key) || solver.RepContains(path_key ^ kFullWidthRepSalt);
+  }
 
   // ---- move generation ----------------------------------------------------
   static bool UselessNonPromotion(const Position& p, Move m) {
@@ -666,7 +692,7 @@ struct SearchImpl {
       if (!ch[i].check) present[npresent++] = ch[i].move;
     for (const auto& em : MoveList<NON_EVASIONS_ALL>(pos)) {
       const Move m = em.move;
-      if (!opt.full_width && (UselessNonPromotion(pos, m) || !IsCandidate(m))) continue;
+      if (!FullWidth() && (UselessNonPromotion(pos, m) || !IsCandidate(m))) continue;
       if (pos.gives_check(m) || !pos.legal(m)) continue;
       bool dup = false;
       for (int i = 0; i < npresent; ++i)
@@ -922,7 +948,14 @@ struct SearchImpl {
   void FlushNodes() {
     solver.total_nodes_.fetch_add(nodes - nodes_reported, std::memory_order_relaxed);
     nodes_reported = nodes;
+    solver.stat_new_.fetch_add(stat_new, std::memory_order_relaxed);
+    solver.stat_tt_return_.fetch_add(stat_tt_return, std::memory_order_relaxed);
+    solver.stat_clamp32_.fetch_add(stat_clamp32, std::memory_order_relaxed);
+    solver.stat_sat_.fetch_add(stat_sat, std::memory_order_relaxed);
+    stat_new = stat_tt_return = stat_clamp32 = stat_sat = 0;
   }
+  // This thread's counters not yet added to the Solver's (see StatsString).
+  std::uint64_t stat_new = 0, stat_tt_return = 0, stat_clamp32 = 0, stat_sat = 0;
 
   // Sub-searches with a budget of their own run on past the limits of the
   // Solve (the greedy answer after a limit: its mate probes are small).
@@ -1047,7 +1080,7 @@ struct SearchImpl {
     sync_cout << os.str() << sync_endl;
     sync_cout << "info string pn=" << (pn >= kInf ? std::string("inf") : std::to_string(pn))
               << " dn=" << (dn >= kInf ? std::string("inf") : std::to_string(dn))
-              << " threads=" << std::max(1, opt.threads) << sync_endl;
+              << " threads=" << std::max(1, opt.threads) << " " << solver.StatsString() << sync_endl;
     seldepth = 0;
   }
 
@@ -1114,7 +1147,7 @@ struct SearchImpl {
   // The children of the node: those of a recently visited node from the
   // children cache (path-dependent values refreshed), else generated.
   void OpenNode(NodeWork& w, Key board, Hand hand, std::uint8_t mode, bool or_node, Move last, int ply) {
-    if (!cache.empty()) {
+    if (!cache.empty() && !force_full_width) {  // (the cache holds the candidates' children)
       const std::uint64_t h = static_cast<std::uint64_t>(board) ^
                               (static_cast<std::uint64_t>(hand) * 0x9E3779B97F4A7C15ULL) ^ mode;
       w.slot = &cache[(h >> 7) % cache.size()];
@@ -1303,7 +1336,7 @@ struct SearchImpl {
     // A disproof contradicted by a proof in the TT (for a hand this one
     // dominates; Store would drop it) holds only through this path.
     if (dn == 0 && !rep && Lookup(board, store_hand, mode).pn == 0) rep = true;
-    if (dn == 0 && rep && !hisshi_ply_limit) solver.RepInsert(CurrentPathKey());
+    if (dn == 0 && rep && !hisshi_ply_limit) solver.RepInsert(RepKey(CurrentPathKey()));
     Store(board, store_hand, mode, pn, dn, len, best_move, rep, effort);
     return NodeResult{pn, dn, len, rep, store_hand};
   }
@@ -1345,8 +1378,11 @@ struct SearchImpl {
       self.dn = 1;
       self.rep = false;
     }
-    if (self.pn == 0 || self.dn == 0 || self.pn >= thpn || self.dn >= thdn)
+    if (self.pn == 0 || self.dn == 0 || self.pn >= thpn || self.dn >= thdn) {
+      ++stat_tt_return;
       return NodeResult{self.pn, self.dn, self.len, self.rep, self.pn == 0 ? self.ph : hand};
+    }
+    if (!self.found) ++stat_new;
 
     // A node with its own TT entry was expanded before; its one-ply mate
     // check already failed then.

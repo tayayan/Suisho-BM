@@ -48,6 +48,12 @@ void Solver::KeepOnlyProofs() {
   proofs_only_ = true;
 }
 
+std::string Solver::StatsString() const {
+  auto v = [](const std::atomic<std::uint64_t>& a) { return std::to_string(a.load(std::memory_order_relaxed)); };
+  return "new=" + v(stat_new_) + " tt_return=" + v(stat_tt_return_) + " clamp32=" + v(stat_clamp32_) +
+         " sat=" + v(stat_sat_);
+}
+
 int Solver::Hashfull() const {
   if (table_.empty()) return 0;
   int used = 0;
@@ -350,6 +356,7 @@ Result Solver::Solve(Position& root, const Limits& given_limits, const Options& 
   std::atomic<bool> helper_rep_disproof{false};  // a helper's root: a disproof resting on a repetition
   std::vector<std::thread> helpers;
   total_nodes_ = 0;
+  stat_new_ = stat_tt_return_ = stat_clamp32_ = stat_sat_ = 0;
   shared_ = nthreads > 1;
   for (int t = 1; t < nthreads; ++t) {
     helpers.emplace_back([&, t]() {

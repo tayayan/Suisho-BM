@@ -443,7 +443,9 @@ struct DisproofVerifier {
     std::vector<Move> tried;
     std::uint64_t budget = kBudget;
     for (int round = 0; round < kRounds; ++round) {
-      // Replies disproven in the TT: path-independent ones first.
+      // Replies disproven in the TT: path-independent ones first. (A reply
+      // that failed is not tried again: in tests, retrying it after the
+      // re-search only cost time.)
       std::vector<std::pair<int, Move>> cands;
       for (Move r : replies) {
         if (std::find(tried.begin(), tried.end(), r) != tried.end()) continue;
@@ -477,7 +479,11 @@ struct DisproofVerifier {
       s.PopPath();
       s.rederive_root = true;
       s.rederive_ply = static_cast<int>(s.path.size()) + 1;  // (SubSearch's root ply)
+      // The first re-search with the candidates (cheaper); the next ones with
+      // every legal attack, as the check (the candidates' disproofs are hints).
+      s.force_full_width = round > 0;
       const NodeResult nr = s.SubSearch(mode, budget);
+      s.force_full_width = false;
       s.rederive_root = false;
       s.PushPath(self);
       budget *= 8;

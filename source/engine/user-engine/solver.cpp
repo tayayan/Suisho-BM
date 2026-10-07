@@ -122,7 +122,7 @@ struct SolveContext {
 
 // Not hisshi: accepted only after the independent check with every legal
 // attack (a disproof resting on a repetition or the depth limit of the path
-// is not a result).
+// is not a result). The check's statistics are appended to verify_info.
 void VerifyDisproof(SearchImpl& s, Position& root, Result& res) {
   const std::uint64_t before = s.nodes;
   const auto t0 = s.ElapsedMs();
@@ -133,12 +133,41 @@ void VerifyDisproof(SearchImpl& s, Position& root, Result& res) {
   s.PopPath();
   res.verified = ok;
   std::ostringstream os;
-  os << "visited=" << v.visited << " searches=" << v.searches << " trees=" << v.trees_disproven << "/" << v.trees
-     << " tree_nodes=" << v.tree_nodes << " research_nodes=" << (s.nodes - before)
-     << " time_ms=" << (s.ElapsedMs() - t0);
+  if (!res.verify_info.empty()) os << res.verify_info << ' ';
+  os << "check=" << ok << " visited=" << v.visited << " searches=" << v.searches
+     << " trees=" << v.trees_disproven << "/" << v.trees << " tree_nodes=" << v.tree_nodes
+     << " research_nodes=" << (s.nodes - before) << " time_ms=" << (s.ElapsedMs() - t0);
   if (!ok) os << " error=" << v.error;
   res.verify_info = os.str();
-  if (!ok) res.status = Status::kUnknown;
+  res.status = ok ? Status::kDisproven : Status::kUnknown;
+}
+
+// A failed disproof check after a multi-thread search: what the TT keeps of
+// the disproofs resting on repetitions depends on the threads' timing (they
+// hold only on the paths they were found on). One thread searches the root
+// again on a cleared table, so that the disproof rests on its own paths,
+// then the check runs again. A proof found meanwhile goes on to the proof
+// verification.
+void ResolveSingleThread(const SolveContext& ctx, const Options& main_opt, Result& res) {
+  ctx.solver.Clear();
+  Options opt = main_opt;
+  opt.threads = 1;
+  if (opt.eps_percent == 0) opt.eps_percent = ctx.opt.single_thread_eps;
+  Position p;
+  StateInfo si;
+  p.set(ctx.root_sfen, &si, ctx.root.this_thread());
+  SearchImpl s(ctx.solver, p, opt, ctx.limits, ctx.should_stop, 0, nullptr);
+  s.root_sfen = ctx.root_sfen;
+  const NodeResult r = s.Run(kModeHisshi);
+  s.FlushNodes();
+  res.verify_info += std::string(" resolve=") + (r.pn == 0 ? "proof" : r.dn == 0 ? "disproof" : "open");
+  if (r.pn == 0) {
+    res.status = Status::kProven;
+    res.pn = 0;
+    res.dn = kInf;
+  } else if (r.dn == 0) {
+    VerifyDisproof(s, p, res);
+  }
 }
 
 // Splits the proof into subtrees (verified on the way down to their roots),
@@ -372,41 +401,11 @@ Result Solver::Solve(Position& root, const Limits& given_limits, const Options& 
   if (r.pn == 0) {
     res.status = Status::kProven;
   } else if (r.dn == 0) {
-    // A disproof resting on a repetition with the root's path: the
-    // independent check (its path starts at the root) decides.
-    res.status = Status::kDisproven;
+    // Not hisshi only after the independent check (its path starts at the
+    // root, so a disproof resting on a repetition with it counts too).
+    if (r.rep) res.verify_info = "rep=1";
     VerifyDisproof(s, root, res);
-    if (r.rep) res.verify_info += " rep=1";
-    for (int retry = 0; retry < 1 && nthreads > 1 && !res.verified && !s.LimitReached(); ++retry) {
-      // The TT check found no way through: what the TT keeps of the
-      // disproofs resting on repetitions depends on the threads' timing
-      // (they hold only on the paths they were found on). One thread
-      // searches the root again on a cleared TT, so that the disproof rests
-      // on its own paths, then the check runs again.
-      Clear();
-      Options ropt = main_opt;
-      ropt.threads = 1;
-      if (ropt.eps_percent == 0) ropt.eps_percent = opt.single_thread_eps;
-      Position rp;
-      StateInfo rsi;
-      rp.set(ctx.root_sfen, &rsi, root.this_thread());
-      SearchImpl rs(*this, rp, ropt, limits, should_stop, 0, nullptr);
-      rs.root_sfen = ctx.root_sfen;
-      const NodeResult rr = rs.Run(kModeHisshi);
-      rs.FlushNodes();
-      res.verify_info += " resolve" + std::to_string(retry) + "=" + (rr.pn == 0 ? "proof" : rr.dn == 0 ? "disproof" : "open");
-      if (rr.pn == 0) {
-        res.status = Status::kProven;
-        res.pn = 0;
-        res.dn = kInf;
-        break;
-      }
-      if (rr.dn != 0) break;
-      const std::string first = res.verify_info;
-      res.status = Status::kDisproven;
-      VerifyDisproof(rs, rp, res);
-      res.verify_info = first + " | retry: " + res.verify_info;
-    }
+    if (nthreads > 1 && !res.verified && !s.LimitReached()) ResolveSingleThread(ctx, main_opt, res);
     res.nodes = TotalNodes();
     res.elapsed_ms = s.ElapsedMs();
   }

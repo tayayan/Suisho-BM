@@ -34,10 +34,20 @@ namespace detail {
 constexpr std::uint8_t kModeHisshi = 0;
 constexpr std::uint8_t kModeMate = 1;
 
+// pn/dn sums. kInf only stands for a decided value (the pn of a disproof,
+// the dn of a proof); an undecided sum saturates at kInf - 1, so that a node
+// merely very hard to prove (pn grows exponentially with the depth of a
+// hisshi tree) is never taken for a disproven one.
 inline PnDn Add(PnDn a, PnDn b) {
-  const PnDn s = a + b;  // both <= kInf, no overflow in 32 bits
-  return s >= kInf ? kInf : s;
+  if (a >= kInf || b >= kInf) return kInf;
+  const PnDn s = a + b;  // both < kInf = 2^60: no overflow
+  return s >= kInf - 1 ? kInf - 1 : s;
 }
+
+// A child's threshold from the second best value: unbounded when that value
+// is saturated (the child then returns through its other value), so that a
+// saturated child is not sent back at once.
+inline PnDn NextThreshold(PnDn second) { return second >= kInf - 1 ? kInf : second + 1; }
 
 // Squares around the defending king (paper, Fig. 2). zone12: squares where
 // an attacking effect counts as an attack; zone3: squares two ranks in front
@@ -951,6 +961,14 @@ struct SearchImpl {
   std::uint64_t nodes_reported = 0;
   PnDn live_root_pn = 1, live_root_dn = 1;
   Move live_root_best = MOVE_NONE;
+  // While the root's best child is searched (the root's values change only
+  // when it returns, which may take minutes): the rest of the root and the
+  // child's own live values, so that the output follows the search.
+  bool live_in_child = false;
+  PnDn live_rest_pn = kInf, live_rest_dn = 0;  // the other children: min pn (with costs), dn of the other groups
+  PnDn live_group_dn = 0;                      // the child's group without the child (max dn)
+  PnDn live_child_cost = 0;
+  PnDn live_child_pn = 1, live_child_dn = 1;
   bool report = false;       // the main thread of the main search prints progress
   int seldepth = 0;          // deepest ply since the last output
   std::string root_sfen;     // to replay the current best line
@@ -998,8 +1016,19 @@ struct SearchImpl {
   void PrintProgress(std::uint64_t ms) {
     const std::uint64_t total = solver.total_nodes_.load(std::memory_order_relaxed);
     const std::uint64_t nps = ms ? total * 1000 / ms : 0;
-    // Live values of the root (kept by the root's OR loop, see Search).
+    // Live values of the root (kept by the root's OR loop, see Search),
+    // with the current values of the child being searched.
     PnDn pn = live_root_pn, dn = live_root_dn;
+    if (live_in_child) {
+      if (live_child_pn == 0) {
+        pn = 0;
+        dn = kInf;
+      } else {
+        pn = std::min(live_rest_pn, live_child_dn == 0 ? kInf : Add(live_child_pn, live_child_cost));
+        dn = Add(live_rest_dn, std::max(live_group_dn, live_child_dn));
+        if (pn > kInf) pn = kInf;
+      }
+    }
     if (!root_sfen.empty()) {
       // Decided by another thread already?
       Position p;
@@ -1040,8 +1069,10 @@ struct SearchImpl {
   static constexpr int kMateEps = 50;
   PnDn Epsilon(PnDn second, std::uint8_t mode) const {
     const int eps = mode == kModeMate ? std::max(opt.eps_percent, kMateEps) : opt.eps_percent;
-    if (eps <= 0 || second >= kInf) return second;
-    return Add(second, (second * static_cast<PnDn>(eps) + 99) / 100);
+    if (eps <= 0 || second >= kInf - 1) return second;
+    // (divided first: second * eps may exceed 64 bits)
+    const PnDn e = static_cast<PnDn>(eps);
+    return Add(second, second / 100 * e + (second % 100 * e + 99) / 100);
   }
 
   // ---- df-pn+ ---------------------------------------------------------------
@@ -1397,12 +1428,25 @@ struct SearchImpl {
         second_v = std::min(second_v, virt);
         Child& c = ch[best];
         const PnDn sec = second_v > kInf ? kInf : second_v;
-        PnDn cthpn = std::min(thpn, Add(Epsilon(sec, mode), 1));
+        PnDn cthpn = std::min(thpn, NextThreshold(Epsilon(sec, mode)));
         cthpn = cthpn >= kInf ? kInf : cthpn - c.cost;
         // The other groups' sum: dn without this group (dn < thdn < kInf here,
         // so the sum was not saturated).
         const PnDn cthdn = thdn >= kInf ? kInf : thdn - (dn - gmax[c.group]);
+        if (ply == 0 && report) {
+          // (progress output: the root without this child)
+          live_rest_pn = sec;
+          live_rest_dn = dn >= kInf ? kInf : dn - gmax[c.group];
+          live_group_dn = 0;
+          for (const int i : live)
+            if (i != best && ch[i].group == c.group) live_group_dn = std::max(live_group_dn, ch[i].dn);
+          live_child_cost = c.cost;
+          live_child_pn = c.pn;
+          live_child_dn = c.dn;
+          live_in_child = true;
+        }
         SearchChild(ply, mode, c, cthpn, cthdn);
+        if (ply == 0) live_in_child = false;
         if (c.pn == 0) killers[ply] = c.move;
       } else {
         // dn: the smallest child; pn: the sum over groups of the groups'
@@ -1431,13 +1475,17 @@ struct SearchImpl {
         if (dn > kInf) dn = kInf;
         pn = Add(active_pn, inactive_pn);
         if (dn == 0) pn = kInf;
+        if (ply == 1 && live_in_child) {
+          live_child_pn = pn;  // (progress output: the root's child being searched)
+          live_child_dn = dn;
+        }
         if (pn >= thpn || dn >= thdn || stop) break;
         if (virt < best_v) { Activate(w, mode, ply); continue; }
         second_v = std::min(second_v, virt);
         Child& c = ch[best];
         if (TryReplay(w, c, mode)) continue;
         const PnDn sec = second_v > kInf ? kInf : second_v;
-        const PnDn cthdn = std::min(thdn, Add(Epsilon(sec, mode), 1));
+        const PnDn cthdn = std::min(thdn, NextThreshold(Epsilon(sec, mode)));
         // (likewise: pn < thpn < kInf here)
         const PnDn cthpn = thpn >= kInf ? kInf : thpn - (pn - gmax[c.group]);
         SearchChild(ply, mode, c, cthpn, cthdn);
@@ -1631,7 +1679,7 @@ struct SearchImpl {
     while (!stop) {
       r = Search(0, mode, kInf, kInf, MOVE_NONE);
       if (r.pn == 0 || r.dn == 0) break;
-      if (r.pn >= kInf || r.dn >= kInf) break;  // saturated: no progress possible
+      if (r.pn >= kInf || r.dn >= kInf) break;  // (a safety net: kInf marks decided values only)
     }
     PopPath();
     return r;

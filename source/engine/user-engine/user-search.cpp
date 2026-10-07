@@ -27,8 +27,9 @@ void user_test(Position& /*pos*/, std::istringstream& /*is*/) {}
 // Only options a user may want to change. Search parameters are fixed at
 // their tuned values (hisshi::Options defaults).
 void USI::extra_option(USI::OptionsMap& o) {
-  // Attacker considers every legal move instead of the paper's candidates
-  // (slower; a "nomate" answer then covers all attacks).
+  // The search considers every legal attack instead of the paper's
+  // candidates (slower; a "nomate" answer is checked with every legal
+  // attack either way).
   o["HisshiFullWidth"] << USI::Option(false);
   // Progress output interval in ms (0 = none).
   o["PvInterval"] << USI::Option(1000, 0, 1000000);

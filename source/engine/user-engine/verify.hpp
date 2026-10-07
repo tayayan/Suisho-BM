@@ -311,29 +311,36 @@ struct Verifier {
 // verified disproof does not depend on the candidate moves of paper 3.1. A
 // repetition counts as a failure of the attacker (a draw, or a loss when he
 // keeps checking). Each defender node needs one refuting reply (the pass
-// counts after a non-check); replies disproven in the TT are tried first,
-// otherwise the node is searched again.
+// counts after a non-check): replies disproven in the TT are tried first;
+// failing those, the node is searched again with a growing budget, and last
+// a small search tree kept in memory decides (TreeRefuter).
+//
+// A refuted position is recorded (and not checked again) when its result
+// rests on no repetition with a position above it: each result carries the
+// shallowest path index of a repetition it rests on (`dep`).
 struct DisproofVerifier {
+  static constexpr std::uint64_t kBudget = 2000000;  // node budget of the first re-search of a node
+  static constexpr int kTries = 4;                   // refuting replies tried per defender node and round
+  static constexpr int kRounds = 3;                  // rounds per defender node (re-search budget x8 each)
+  static constexpr std::size_t kTreeNodes = std::size_t(1) << 22;     // nodes of one search tree
+  static constexpr std::uint64_t kTreeTotal = std::uint64_t(1) << 26;  // nodes of all the trees of one check
+  static constexpr int kNoDep = 0x7fffffff;  // a result resting on no repetition
+
   SearchImpl& s;
   Position& pos;
   KeySet done;              // refuted positions (key ^ mode salt), not depending on the path
   std::vector<Key> on_path;
-  std::uint64_t visited = 0, searches = 0;
-  std::string error;
   std::vector<StateInfo> st;
-  static constexpr std::uint64_t kBudget = 2000000;  // node budget of one re-search
-  static constexpr int kTries = 4;                   // refuting replies tried per defender node and round
-  static constexpr int kRounds = 3;                  // re-searches of a defender node (budget x8 each)
-  static constexpr std::size_t kTreeNodes = std::size_t(1) << 22;  // nodes of one search tree (TreeRefuter)
-  static constexpr std::uint64_t kTreeTotal = std::uint64_t(1) << 26;  // nodes of all the trees of one check
-  std::uint64_t trees = 0, trees_disproven = 0, tree_nodes = 0, last_tree_nodes = 0;
+  std::string error;
+  // Statistics.
+  std::uint64_t visited = 0, searches = 0;
+  std::uint64_t trees = 0, trees_disproven = 0, tree_nodes = 0;
+  std::uint64_t last_tree_nodes = 0;
   bool last_tree_full = false;
 
   explicit DisproofVerifier(SearchImpl& si) : s(si), pos(si.pos) { st.resize(4096); }
 
   static Key Salt(Key k, std::uint8_t mode) { return mode ? k ^ 0x9e3779b97f4a7c15ULL : k; }
-
-  static constexpr int kNoDep = 0x7fffffff;  // a result resting on no repetition
 
   // True when the attacker cannot force hisshi (mate below a pass) here.
   // `dep` is lowered to the shallowest path index of a repetition the result
@@ -367,12 +374,7 @@ struct DisproofVerifier {
     for (const auto& em : MoveList<LEGAL_ALL>(pos)) {
       const Move m = em.move;
       if (mode == kModeMate && !pos.gives_check(m)) continue;
-      pos.do_move(m, st[depth]);
-      s.PushPath(s.PathEntry(pos.key(), mode));
-      const bool ok = Refuted(depth + 1, mode, dep);
-      s.PopPath();
-      pos.undo_move(m);
-      if (!ok) {
+      if (!Refutes(depth, mode, m, dep)) {
         if (error.empty()) error = "attack " + to_usi_string(m) + " not refuted";
         return false;
       }
@@ -380,17 +382,36 @@ struct DisproofVerifier {
     return true;
   }
 
-  // Probe of a defender's reply (MOVE_NULL = the pass).
-  // The reply's TT result for this path (the searcher's path is the
-  // verification path, so disproofs resting on a repetition with it count).
-  Probe ProbeReply(Move r, std::uint8_t mode) {
+  // Plays move m (MOVE_NULL: the defender's pass, below which the attacker
+  // must mate) and checks the position after it.
+  bool Refutes(int depth, std::uint8_t mode, Move m, int& dep) {
+    const bool pass = m == MOVE_NULL;
+    const std::uint8_t cmode = pass ? kModeMate : mode;
+    if (pass) pos.do_null_move(st[depth]);
+    else pos.do_move(m, st[depth]);
+    s.PushPath(s.PathEntry(pos.key(), cmode));
+    const bool ok = Refuted(depth + 1, cmode, dep);
+    s.PopPath();
+    if (pass) pos.undo_null_move();
+    else pos.undo_move(m);
+    return ok;
+  }
+
+  // The keys of the position after the defender's reply r (MOVE_NULL: the pass).
+  void ReplyKeys(Move r, std::uint8_t mode, Key& board, Hand& hand, std::uint8_t& cmode, Key& full) {
     Child c{};
     c.move = r;
     c.pass = r == MOVE_NULL;
+    s.ChildKey(c, mode, board, hand, cmode, full);
+  }
+
+  // The reply's TT result for this path (the searcher's path is the
+  // verification path, so disproofs resting on a repetition with it count).
+  Probe ProbeReply(Move r, std::uint8_t mode) {
     Key board, full;
     Hand hand;
     std::uint8_t cmode;
-    s.ChildKey(c, mode, board, hand, cmode, full);
+    ReplyKeys(r, mode, board, hand, cmode, full);
     // Disproven through a repetition with this path (also when the TT holds
     // a proof of the position, whose lines then run through the path).
     if (s.RepAt(s.ChildPathKey(full))) {
@@ -405,34 +426,11 @@ struct DisproofVerifier {
   }
 
   bool ReplyOnPath(Move r, std::uint8_t mode) {
-    Child c{};
-    c.move = r;
-    c.pass = r == MOVE_NULL;
     Key board, full;
     Hand hand;
     std::uint8_t cmode;
-    s.ChildKey(c, mode, board, hand, cmode, full);
+    ReplyKeys(r, mode, board, hand, cmode, full);
     return s.InPath(full);
-  }
-
-  bool TryReply(int depth, std::uint8_t mode, Move r, int& dep) {
-    int c = kNoDep;
-    bool ok;
-    if (r == MOVE_NULL) {
-      pos.do_null_move(st[depth]);
-      s.PushPath(s.PathEntry(pos.key(), kModeMate));
-      ok = Refuted(depth + 1, kModeMate, c);
-      s.PopPath();
-      pos.undo_null_move();
-    } else {
-      pos.do_move(r, st[depth]);
-      s.PushPath(s.PathEntry(pos.key(), mode));
-      ok = Refuted(depth + 1, mode, c);
-      s.PopPath();
-      pos.undo_move(r);
-    }
-    if (ok) dep = std::min(dep, c);
-    return ok;
   }
 
   // Defender to move: one reply must refute.
@@ -460,13 +458,18 @@ struct DisproofVerifier {
       for (const auto& [rep, r] : cands) {
         if (static_cast<int>(tried.size()) >= kTries * (round + 1)) break;
         tried.push_back(r);
-        std::string saved = error;
-        if (TryReply(depth, mode, r, dep)) { error.clear(); return true; }
-        if (saved.empty() && !error.empty()) saved = error;
-        error = saved;
+        const std::string saved = error;
+        int c = kNoDep;
+        if (Refutes(depth, mode, r, c)) {
+          dep = std::min(dep, c);
+          error.clear();
+          return true;
+        }
+        if (!saved.empty()) error = saved;  // (keep the first failure)
       }
       if (round == kRounds - 1 || s.LimitReached()) break;
-      // Search this node again to find (another) disproof.
+      // Search this node again to find (another) disproof; a hard node gets
+      // a larger search next time.
       ++searches;
       // (SubSearch puts this node on the path itself: off the path meanwhile,
       // so that its path keys are the verification path's)
@@ -475,32 +478,38 @@ struct DisproofVerifier {
       s.rederive_root = true;
       s.rederive_ply = static_cast<int>(s.path.size()) + 1;  // (SubSearch's root ply)
       const NodeResult nr = s.SubSearch(mode, budget);
-      budget *= 8;  // a hard node: a larger search next time
       s.rederive_root = false;
       s.PushPath(self);
+      budget *= 8;
       if (nr.pn == 0) break;  // (proven: no refuting reply)
     }
-    // The TT shows no refuting reply (disproofs resting on repetitions hold
-    // only for the paths they were found on): a small search tree without
-    // transpositions from this node decides, its repetitions judged on its
-    // own paths below the verification path.
-    if (tree_nodes < kTreeTotal) {
-      const std::vector<Key> above(s.path.begin(), s.path.end() - 1);
-      TreeRefuter tree(pos, s.atk, mode, above, &s, kTreeNodes, [this]() { return s.LimitReached(); });
-      const auto tr = tree.Run();
-      ++trees;
-      tree_nodes += tr.nodes;
-      last_tree_nodes = tr.nodes;
-      last_tree_full = tr.full;
-      if (tr.disproven) {
-        ++trees_disproven;
-        if (tr.rep_above) dep = std::min(dep, tr.rep_index);  // (resting on the path above)
-        error.clear();
-        return true;
-      }
+    if (TreeRefutes(mode, dep)) {
+      error.clear();
+      return true;
     }
-    if (error.empty()) error = "no refuting reply at " + pos.sfen() + " (tree " + std::to_string(last_tree_nodes) + (last_tree_full ? " full)" : ")");
+    if (error.empty())
+      error = "no refuting reply at " + pos.sfen() + " (tree " + std::to_string(last_tree_nodes) +
+              (last_tree_full ? " full)" : ")");
     return false;
+  }
+
+  // The TT shows no refuting reply (disproofs resting on repetitions hold
+  // only for the paths they were found on): a small search tree without
+  // transpositions from this node decides, its repetitions judged on its own
+  // paths below the verification path.
+  bool TreeRefutes(std::uint8_t mode, int& dep) {
+    if (tree_nodes >= kTreeTotal) return false;
+    const std::vector<Key> above(s.path.begin(), s.path.end() - 1);
+    TreeRefuter tree(pos, s.atk, mode, above, &s, kTreeNodes, [this]() { return s.LimitReached(); });
+    const TreeRefuter::Result tr = tree.Run();
+    ++trees;
+    tree_nodes += tr.nodes;
+    last_tree_nodes = tr.nodes;
+    last_tree_full = tr.full;
+    if (!tr.disproven) return false;
+    ++trees_disproven;
+    dep = std::min(dep, tr.rep_index);  // (this node's index when it rests on nothing above)
+    return true;
   }
 };
 

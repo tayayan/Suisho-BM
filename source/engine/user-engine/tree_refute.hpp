@@ -36,8 +36,10 @@ class TreeRefuter {
     bool disproven = false;  // the attacker cannot force hisshi
     bool stopped = false;    // a limit of the Solve
     bool full = false;       // the tree's memory was used up
-    bool rep_above = false;  // the disproof rests on a repetition with a position above the root
-    int rep_index = 0;       // (rep_above) the shallowest index in `above` it rests on
+    // (disproven) the shallowest path index of a repetition the disproof
+    // rests on: an index in `above`, or at least above.size() when it rests
+    // on no position above the root
+    int rep_index = 0;
     std::uint64_t nodes = 0;
   };
 
@@ -67,9 +69,9 @@ class TreeRefuter {
       Search(0, 0, kInf, kInf);
       const Node& root = nodes_[0];
       if (root.pn == 0 || root.dn == 0) break;
+      if (root.pn >= kInf || root.dn >= kInf) break;  // (a safety net: kInf marks decided values only)
     }
     res.disproven = nodes_[0].dn == 0;
-    res.rep_above = res.disproven && nodes_[0].rep < static_cast<std::int16_t>(above_.size());
     res.rep_index = nodes_[0].rep;
     res.stopped = stopped_;
     res.full = full_;
@@ -108,7 +110,7 @@ class TreeRefuter {
   bool full_ = false;  // the tree's memory is used up
   std::uint64_t checks_ = 0;
 
-  static PnDn Add(PnDn a, PnDn b) { return a + b >= kInf ? kInf : a + b; }
+  // (Add and NextThreshold: see search.hpp)
   static Key PathKey(Key k, std::uint8_t mode) { return mode == kModeMate ? k ^ kMateSalt : k; }
 
   static void SetWin(Node& n) { n.pn = 0; n.dn = kInf; n.expanded = 1; n.rep = kNoRep; }
@@ -275,10 +277,10 @@ class TreeRefuter {
       const Node c = nodes_[cid];
       PnDn cthpn, cthdn;
       if (or_node) {
-        cthpn = std::min(thpn, Add(second, 1));
+        cthpn = std::min(thpn, NextThreshold(second));
         cthdn = (thdn >= kInf || dn >= kInf) ? thdn : thdn - (dn - c.dn);
       } else {
-        cthdn = std::min(thdn, Add(second, 1));
+        cthdn = std::min(thdn, NextThreshold(second));
         cthpn = (thpn >= kInf || pn >= kInf) ? thpn : thpn - (pn - c.pn);
       }
       StateInfo& st = states_[ply];

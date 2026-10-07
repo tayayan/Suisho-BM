@@ -521,6 +521,8 @@ struct SearchImpl {
   bool rederive_root = false;
   int rederive_ply = -1;
   Key ChildPathKey(Key full) const { return PathMix(CurrentPathKey(), full); }
+  // Is the position at this path key disproven through a repetition with its path?
+  bool RepAt(Key path_key) const { return solver.RepContains(path_key); }
 
   // ---- move generation ----------------------------------------------------
   static bool UselessNonPromotion(const Position& p, Move m) {

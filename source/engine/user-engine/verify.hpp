@@ -5,6 +5,7 @@
 #define HISSHI_VERIFY_HPP_
 
 #include "search.hpp"
+#include "tree_refute.hpp"
 
 namespace hisshi {
 namespace detail {
@@ -321,37 +322,54 @@ struct DisproofVerifier {
   std::string error;
   std::vector<StateInfo> st;
   static constexpr std::uint64_t kBudget = 2000000;  // node budget of one re-search
-  static constexpr int kTries = 4;                   // refuting replies tried per defender node
+  static constexpr int kTries = 4;                   // refuting replies tried per defender node and round
+  static constexpr int kRounds = 3;                  // re-searches of a defender node (budget x8 each)
+  static constexpr std::size_t kTreeNodes = std::size_t(1) << 22;  // nodes of one search tree (TreeRefuter)
+  static constexpr std::uint64_t kTreeTotal = std::uint64_t(1) << 26;  // nodes of all the trees of one check
+  std::uint64_t trees = 0, trees_disproven = 0, tree_nodes = 0, last_tree_nodes = 0;
+  bool last_tree_full = false;
 
   explicit DisproofVerifier(SearchImpl& si) : s(si), pos(si.pos) { st.resize(4096); }
 
   static Key Salt(Key k, std::uint8_t mode) { return mode ? k ^ 0x9e3779b97f4a7c15ULL : k; }
 
+  static constexpr int kNoDep = 0x7fffffff;  // a result resting on no repetition
+
   // True when the attacker cannot force hisshi (mate below a pass) here.
-  // `cyc` is set when the result relies on a repetition with the path.
-  bool Refuted(int depth, std::uint8_t mode, bool& cyc) {
+  // `dep` is lowered to the shallowest path index of a repetition the result
+  // rests on. A result resting only on repetitions with this node or below
+  // holds on every path to it (such a cycle is one on every path), so it is
+  // recorded as refuted.
+  bool Refuted(int depth, std::uint8_t mode, int& dep) {
     const Key k = Salt(pos.key(), mode);
     if (done.Contains(k)) return true;
-    if (std::find(on_path.begin(), on_path.end(), k) != on_path.end()) { cyc = true; return true; }
+    const auto it = std::find(on_path.begin(), on_path.end(), k);
+    if (it != on_path.end()) {
+      dep = std::min(dep, static_cast<int>(it - on_path.begin()));
+      return true;
+    }
     if (depth >= 4000) { error = "too deep"; return false; }
     ++visited;
+    const int index = static_cast<int>(on_path.size());
     on_path.push_back(k);
-    bool my_cyc = false;
-    const bool ok = pos.side_to_move() == s.atk ? OrRefuted(depth, mode, my_cyc) : AndRefuted(depth, mode, my_cyc);
+    int my_dep = kNoDep;
+    const bool ok = pos.side_to_move() == s.atk ? OrRefuted(depth, mode, my_dep) : AndRefuted(depth, mode, my_dep);
     on_path.pop_back();
-    if (ok && !my_cyc) done.Insert(k);
-    cyc |= my_cyc;
+    if (ok) {
+      if (my_dep >= index) done.Insert(k);
+      else dep = std::min(dep, my_dep);
+    }
     return ok;
   }
 
   // Attacker to move: every legal move (every check below a pass) must fail.
-  bool OrRefuted(int depth, std::uint8_t mode, bool& cyc) {
+  bool OrRefuted(int depth, std::uint8_t mode, int& dep) {
     for (const auto& em : MoveList<LEGAL_ALL>(pos)) {
       const Move m = em.move;
       if (mode == kModeMate && !pos.gives_check(m)) continue;
       pos.do_move(m, st[depth]);
       s.PushPath(s.PathEntry(pos.key(), mode));
-      const bool ok = Refuted(depth + 1, mode, cyc);
+      const bool ok = Refuted(depth + 1, mode, dep);
       s.PopPath();
       pos.undo_move(m);
       if (!ok) {
@@ -373,6 +391,16 @@ struct DisproofVerifier {
     Hand hand;
     std::uint8_t cmode;
     s.ChildKey(c, mode, board, hand, cmode, full);
+    // Disproven through a repetition with this path (also when the TT holds
+    // a proof of the position, whose lines then run through the path).
+    if (s.RepAt(s.ChildPathKey(full))) {
+      Probe p;
+      p.pn = kInf;
+      p.dn = 0;
+      p.found = true;
+      p.rep = true;
+      return p;
+    }
     return s.Lookup(board, hand, cmode, s.ChildPathKey(full));
   }
 
@@ -387,8 +415,8 @@ struct DisproofVerifier {
     return s.InPath(full);
   }
 
-  bool TryReply(int depth, std::uint8_t mode, Move r, bool& cyc) {
-    bool c = false;
+  bool TryReply(int depth, std::uint8_t mode, Move r, int& dep) {
+    int c = kNoDep;
     bool ok;
     if (r == MOVE_NULL) {
       pos.do_null_move(st[depth]);
@@ -403,19 +431,20 @@ struct DisproofVerifier {
       s.PopPath();
       pos.undo_move(r);
     }
-    if (ok) cyc |= c;
+    if (ok) dep = std::min(dep, c);
     return ok;
   }
 
   // Defender to move: one reply must refute.
-  bool AndRefuted(int depth, std::uint8_t mode, bool& cyc) {
+  bool AndRefuted(int depth, std::uint8_t mode, int& dep) {
     const bool check = pos.in_check();
     std::vector<Move> replies;
     if (!check) replies.push_back(MOVE_NULL);
     for (const auto& em : MoveList<LEGAL_ALL>(pos)) replies.push_back(em.move);
     if (check && replies.empty()) { error = "mated"; return false; }
     std::vector<Move> tried;
-    for (int round = 0; round < 2; ++round) {
+    std::uint64_t budget = kBudget;
+    for (int round = 0; round < kRounds; ++round) {
       // Replies disproven in the TT: path-independent ones first.
       std::vector<std::pair<int, Move>> cands;
       for (Move r : replies) {
@@ -429,14 +458,14 @@ struct DisproofVerifier {
       std::stable_sort(cands.begin(), cands.end(),
                        [](const auto& a, const auto& b) { return a.first < b.first; });
       for (const auto& [rep, r] : cands) {
-        if (static_cast<int>(tried.size()) >= kTries * 2) break;
+        if (static_cast<int>(tried.size()) >= kTries * (round + 1)) break;
         tried.push_back(r);
         std::string saved = error;
-        if (TryReply(depth, mode, r, cyc)) { error.clear(); return true; }
+        if (TryReply(depth, mode, r, dep)) { error.clear(); return true; }
         if (saved.empty() && !error.empty()) saved = error;
         error = saved;
       }
-      if (round == 1) break;
+      if (round == kRounds - 1 || s.LimitReached()) break;
       // Search this node again to find (another) disproof.
       ++searches;
       // (SubSearch puts this node on the path itself: off the path meanwhile,
@@ -445,12 +474,32 @@ struct DisproofVerifier {
       s.PopPath();
       s.rederive_root = true;
       s.rederive_ply = static_cast<int>(s.path.size()) + 1;  // (SubSearch's root ply)
-      const NodeResult nr = s.SubSearch(mode, kBudget);
+      const NodeResult nr = s.SubSearch(mode, budget);
+      budget *= 8;  // a hard node: a larger search next time
       s.rederive_root = false;
       s.PushPath(self);
-      if (nr.dn != 0) break;
+      if (nr.pn == 0) break;  // (proven: no refuting reply)
     }
-    if (error.empty()) error = "no refuting reply at " + pos.sfen();
+    // The TT shows no refuting reply (disproofs resting on repetitions hold
+    // only for the paths they were found on): a small search tree without
+    // transpositions from this node decides, its repetitions judged on its
+    // own paths below the verification path.
+    if (tree_nodes < kTreeTotal) {
+      const std::vector<Key> above(s.path.begin(), s.path.end() - 1);
+      TreeRefuter tree(pos, s.atk, mode, above, &s, kTreeNodes, [this]() { return s.LimitReached(); });
+      const auto tr = tree.Run();
+      ++trees;
+      tree_nodes += tr.nodes;
+      last_tree_nodes = tr.nodes;
+      last_tree_full = tr.full;
+      if (tr.disproven) {
+        ++trees_disproven;
+        if (tr.rep_above) dep = std::min(dep, tr.rep_index);  // (resting on the path above)
+        error.clear();
+        return true;
+      }
+    }
+    if (error.empty()) error = "no refuting reply at " + pos.sfen() + " (tree " + std::to_string(last_tree_nodes) + (last_tree_full ? " full)" : ")");
     return false;
   }
 };

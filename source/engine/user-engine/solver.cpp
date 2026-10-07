@@ -14,19 +14,27 @@ using namespace detail;
 
 void Solver::Resize(std::size_t mb) {
   const std::size_t bytes = std::max<std::size_t>(mb, 1) * 1024 * 1024;
-  std::size_t clusters = bytes / sizeof(Cluster);
+  // A sixteenth of the hash for the repetition table (at least 2^20 keys).
+  std::size_t rep_entries = std::size_t(1) << 20;
+  while (rep_entries * 2 * sizeof(std::uint64_t) <= bytes / 16) rep_entries *= 2;
+  const std::size_t rep_bytes = rep_entries * sizeof(std::uint64_t);
+  std::size_t clusters = (bytes > rep_bytes ? bytes - rep_bytes : 0) / sizeof(Cluster);
   if (clusters < 1024) clusters = 1024;
-  if (clusters == cluster_count_ && !table_.empty()) return;
+  if (clusters == cluster_count_ && !table_.empty() && rep_entries == rep_mask_ + 1) return;
   table_.clear();
   table_.shrink_to_fit();
   table_.resize(clusters);
   cluster_count_ = clusters;
+  rep_table_.reset();
+  rep_table_.reset(new std::atomic<std::uint64_t>[rep_entries]);
+  rep_mask_ = rep_entries - 1;
   Clear();
 }
 
 void Solver::Clear() {
   if (!table_.empty()) std::memset(static_cast<void*>(table_.data()), 0, table_.size() * sizeof(Cluster));
-  for (std::size_t i = 0; i < kRepTableSize; ++i) rep_table_[i].store(0, std::memory_order_relaxed);
+  if (rep_table_)
+    for (std::size_t i = 0; i <= rep_mask_; ++i) rep_table_[i].store(0, std::memory_order_relaxed);
   dirty_ = false;
 }
 
@@ -119,13 +127,14 @@ void VerifyDisproof(SearchImpl& s, Position& root, Result& res) {
   const std::uint64_t before = s.nodes;
   const auto t0 = s.ElapsedMs();
   DisproofVerifier v(s);
-  bool cyc = false;
+  int dep = DisproofVerifier::kNoDep;
   s.PushPath(root.key());
-  const bool ok = v.Refuted(0, kModeHisshi, cyc);
+  const bool ok = v.Refuted(0, kModeHisshi, dep);
   s.PopPath();
   res.verified = ok;
   std::ostringstream os;
-  os << "visited=" << v.visited << " searches=" << v.searches << " research_nodes=" << (s.nodes - before)
+  os << "visited=" << v.visited << " searches=" << v.searches << " trees=" << v.trees_disproven << "/" << v.trees
+     << " tree_nodes=" << v.tree_nodes << " research_nodes=" << (s.nodes - before)
      << " time_ms=" << (s.ElapsedMs() - t0);
   if (!ok) os << " error=" << v.error;
   res.verify_info = os.str();
@@ -368,6 +377,38 @@ Result Solver::Solve(Position& root, const Limits& given_limits, const Options& 
     res.status = Status::kDisproven;
     VerifyDisproof(s, root, res);
     if (r.rep) res.verify_info += " rep=1";
+    for (int retry = 0; retry < 1 && nthreads > 1 && !res.verified && !s.LimitReached(); ++retry) {
+      // The TT check found no way through: what the TT keeps of the
+      // disproofs resting on repetitions depends on the threads' timing
+      // (they hold only on the paths they were found on). One thread
+      // searches the root again on a cleared TT, so that the disproof rests
+      // on its own paths, then the check runs again.
+      Clear();
+      Options ropt = main_opt;
+      ropt.threads = 1;
+      if (ropt.eps_percent == 0) ropt.eps_percent = opt.single_thread_eps;
+      Position rp;
+      StateInfo rsi;
+      rp.set(ctx.root_sfen, &rsi, root.this_thread());
+      SearchImpl rs(*this, rp, ropt, limits, should_stop, 0, nullptr);
+      rs.root_sfen = ctx.root_sfen;
+      const NodeResult rr = rs.Run(kModeHisshi);
+      rs.FlushNodes();
+      res.verify_info += " resolve" + std::to_string(retry) + "=" + (rr.pn == 0 ? "proof" : rr.dn == 0 ? "disproof" : "open");
+      if (rr.pn == 0) {
+        res.status = Status::kProven;
+        res.pn = 0;
+        res.dn = kInf;
+        break;
+      }
+      if (rr.dn != 0) break;
+      const std::string first = res.verify_info;
+      res.status = Status::kDisproven;
+      VerifyDisproof(rs, rp, res);
+      res.verify_info = first + " | retry: " + res.verify_info;
+    }
+    res.nodes = TotalNodes();
+    res.elapsed_ms = s.ElapsedMs();
   }
   if (res.status != Status::kProven) return res;
 

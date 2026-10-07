@@ -145,14 +145,16 @@ class Solver {
   // Disproofs resting on a repetition with the path (the GHI problem): the
   // TT entry only gets a flag, and the path keys of the nodes so disproven
   // are kept here; such a disproof holds only for the same path (as in
-  // KomoringHeights' RepetitionTable). Lossy: a lost key costs a re-search.
-  static constexpr std::size_t kRepTableSize = std::size_t(1) << 20;
-  std::unique_ptr<std::atomic<std::uint64_t>[]> rep_table_{new std::atomic<std::uint64_t>[kRepTableSize]};
+  // KomoringHeights' RepetitionTable). Lossy: a lost key costs a re-search,
+  // and the disproof check needs the keys of the whole disproof, so the
+  // table takes a share of the hash (Resize) rather than a fixed size.
+  std::size_t rep_mask_ = 0;  // entries - 1 (a power of two)
+  std::unique_ptr<std::atomic<std::uint64_t>[]> rep_table_;
   void RepInsert(std::uint64_t path_key) {
-    rep_table_[path_key & (kRepTableSize - 1)].store(path_key, std::memory_order_relaxed);
+    rep_table_[path_key & rep_mask_].store(path_key, std::memory_order_relaxed);
   }
   bool RepContains(std::uint64_t path_key) const {
-    return path_key != 0 && rep_table_[path_key & (kRepTableSize - 1)].load(std::memory_order_relaxed) == path_key;
+    return path_key != 0 && rep_table_[path_key & rep_mask_].load(std::memory_order_relaxed) == path_key;
   }
   bool proofs_only_ = false;  // after the search: proofs are kept (verification, answer)
 };

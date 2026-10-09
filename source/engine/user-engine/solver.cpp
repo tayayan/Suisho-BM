@@ -317,7 +317,10 @@ void BuildAnswer(const SolveContext& ctx, SearchImpl& s, AtomicHandSet* verified
   }
   res.pv = builder.Pv(s);
   pool.reset();  // (its searchers add their nodes)
+  // A last attack giving check: the mate is shown up to the checkmate.
+  const int mate_tail = builder.AppendMateLine(s, res.pv);
   s.FlushNodes();
+  if (mate_tail) res.verify_info += " mate_tail=" + std::to_string(mate_tail);
   res.verify_info += std::string(" answer=") + (builder.exact ? "longest" : "greedy") +
                      " answer_ms=" + std::to_string(s.ElapsedMs() - t0) +
                      " answer_nodes=" + std::to_string(ctx.solver.TotalNodes() - n0);

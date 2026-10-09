@@ -937,6 +937,118 @@ struct PvBuilder {
     return pv;
   }
 
+  // ---- the mate after a final check -----------------------------------------
+  // An answer whose last attack is a check ends where every reply is mated:
+  // the mate itself is shown then, up to the checkmate (the defender's longest
+  // resistance, the attacker's shortest mate, futile interpositions left out
+  // with Options::futile). Mate lengths come from the mate-mode proofs (re-
+  // proven when evicted); the line is left as it was when one is missing.
+  static constexpr int kMaxMateTail = 255;               // plies of the shown mate
+  static constexpr std::uint64_t kMateTailProbe = 1000000;  // re-proof of an evicted mate position
+
+  // Plies to the checkmate at the current position (attacker to move: his
+  // shortest mate; defender to move: his longest resistance, 0 when mated),
+  // -1 when no mate is known.
+  int MateLen(SearchImpl& h) {
+    Position& p = h.pos;
+    if (p.side_to_move() != atk && MoveList<LEGAL_ALL>(p).size() == 0) return p.in_check() ? 0 : -1;
+    if (p.side_to_move() == atk && !p.in_check() && Mate::mate_1ply(p) != MOVE_NONE) return 1;
+    Probe pr = h.Lookup(BoardKey(p), p.hand_of(atk), kModeMate);
+    if (pr.pn != 0 && pr.dn != 0) {
+      h.SubSearch(kModeMate, kMateTailProbe);
+      pr = h.Lookup(BoardKey(p), p.hand_of(atk), kModeMate);
+    }
+    return pr.pn == 0 ? pr.len : -1;
+  }
+
+  // The legal move of the piece on `from` to `to` (a capture of an
+  // interposition: the non-promotion when both are legal), MOVE_NONE if none.
+  static Move MoveFromTo(const Position& p, Square from, Square to) {
+    Move found = MOVE_NONE;
+    for (const auto& em : MoveList<LEGAL_ALL>(p))
+      if (!is_drop(em.move) && from_sq(em.move) == from && to_sq(em.move) == to) {
+        if (found == MOVE_NONE || is_promote(found)) found = em.move;
+      }
+    return found;
+  }
+
+  // Appends the mate after `pv` when its last move is a check. Returns the
+  // number of plies appended.
+  int AppendMateLine(SearchImpl& h, std::vector<Move>& pv) {
+    Position& p = h.pos;
+    std::vector<StateInfo> st(pv.size() + kMaxMateTail + 2);
+    std::size_t ply = 0;
+    for (; ply < pv.size(); ++ply) p.do_move(pv[ply], st[ply]);
+    const std::size_t base = pv.size();
+    bool ok = !pv.empty() && p.side_to_move() != atk && p.in_check();
+    Square slider = SQ_NB;  // the checking slider (futile interpositions)
+    if (ok && IsSlider(type_of(p.piece_on(to_sq(pv.back()))))) slider = to_sq(pv.back());
+    bool mated = false;
+    while (ok && pv.size() - base < static_cast<std::size_t>(kMaxMateTail)) {
+      Move chosen = MOVE_NONE;
+      if (p.side_to_move() != atk) {
+        if (MoveList<LEGAL_ALL>(p).size() == 0) {
+          mated = true;
+          break;
+        }
+        // The longest resistance; an interposition is futile when the
+        // slider's capture mates no later than the best other defence.
+        int best = -1, best_other = -1;
+        std::vector<std::pair<int, Move>> inters;
+        for (const auto& em : MoveList<LEGAL_ALL>(p)) {
+          p.do_move(em.move, st[ply]);
+          const int len = MateLen(h);
+          p.undo_move(em.move);
+          if (len < 0) { ok = false; break; }
+          if (IsInterposition(p, em.move, slider)) {
+            inters.emplace_back(len, em.move);
+            continue;
+          }
+          if (len > best_other) best_other = len;
+          if (len > best) { best = len; chosen = em.move; }
+        }
+        if (!ok) break;
+        for (const auto& [len, m] : inters) {
+          if (best_other >= 0) {
+            StateInfo s1, s2;
+            p.do_move(m, s1);
+            const Move cap = MoveFromTo(p, slider, to_sq(m));
+            int after = -1;
+            if (cap != MOVE_NONE) {
+              p.do_move(cap, s2);
+              after = MateLen(h);
+              p.undo_move(cap);
+            }
+            p.undo_move(m);
+            if (after >= 0 && after + 1 <= best_other) continue;  // futile
+          }
+          if (len > best) { best = len; chosen = m; }
+        }
+      } else {
+        // The shortest mate (a check whose position is mated soonest).
+        int best = 0x7fffffff;
+        for (const auto& em : MoveList<LEGAL_ALL>(p)) {
+          if (!p.gives_check(em.move)) continue;
+          p.do_move(em.move, st[ply]);
+          const int len = MateLen(h);
+          p.undo_move(em.move);
+          if (len >= 0 && len < best) { best = len; chosen = em.move; }
+        }
+        if (chosen != MOVE_NONE && IsSlider(type_of(p.moved_piece_after(chosen)))) slider = to_sq(chosen);
+        else if (chosen != MOVE_NONE) slider = SQ_NB;
+      }
+      if (chosen == MOVE_NONE) { ok = false; break; }
+      pv.push_back(chosen);
+      p.do_move(chosen, st[ply++]);
+    }
+    while (ply > 0) p.undo_move(pv[--ply]);
+    if (!ok || !mated) {
+      pv.resize(base);  // no complete mate: the answer as it was
+      return 0;
+    }
+    return static_cast<int>(pv.size() - base);
+  }
+
   // Greedy answer (fallback): shortest proof for the attacker, longest proof
   // for the defender, futile interpositions excluded.
   std::vector<Move> GreedyPv(SearchImpl& h) {

@@ -371,13 +371,8 @@ void* aligned_ttmem_alloc(size_t allocSize, void*& mem , size_t align /* ignore 
 static void* aligned_ttmem_alloc_large_pages(size_t allocSize) {
 
 	// LargePageはエンジンオプションにより無効化されているなら何もせずに返る。
-#if defined(USER_ENGINE)
-	// The hisshi engine has no LargePageEnable option (its tables are ordinary allocations).
-	return nullptr;
-#else
 	if (!Options["LargePageEnable"])
 		return nullptr;
-#endif
 
 	HANDLE hProcessToken{ };
 	LUID luid{ };

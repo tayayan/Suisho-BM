@@ -140,7 +140,9 @@ struct Child {
   std::uint8_t check;
   std::uint8_t stage;
   std::uint8_t sim;  // proof simulation already tried
+  std::uint8_t m1;   // the reply was tested at activation: not mated in one
 };
+static_assert(sizeof(Child) == 40, "Child size (the cache slot count) changed");
 
 // A list of children in caller-provided storage: a per-ply buffer, or a
 // children-cache slot that is then updated in place.
@@ -228,12 +230,18 @@ struct SearchImpl {
 
   static constexpr int kCacheMinChildren = 12;
   static constexpr int kCacheMaxChildren = kMaxChildren;
-  struct CacheSlot {
+  // The keys of the slots are kept apart from the slots (about 31 KB each):
+  // the probe of every visit reads a 16-byte tag, not a cold slot line.
+  struct CacheTag {
     Key board;
     std::uint32_t hand;
     std::uint8_t mode;
     std::uint8_t valid;
     std::uint8_t in_use;  // a node on the current path works on this slot
+    std::uint8_t pad;
+  };
+  std::vector<CacheTag> ctag;
+  struct CacheSlot {
     std::uint8_t active;
     std::uint16_t n;
     std::uint16_t groups;
@@ -242,7 +250,11 @@ struct SearchImpl {
     Child ch[kCacheMaxChildren];
     Key full[kCacheMaxChildren];
   };
-  std::vector<CacheSlot> cache;
+  // The children cache: own storage, or the Solver's buffer kept across
+  // solves (main search: no allocation and zeroing per solve).
+  CacheSlot* cache = nullptr;
+  std::size_t cache_n = 0;
+  std::vector<CacheSlot> cache_own;
   std::vector<StateInfo> states;
 
   // Parallel search: thread 0 is the main thread; helpers share the TT and
@@ -251,9 +263,16 @@ struct SearchImpl {
   std::atomic<bool>* shared_stop = nullptr;
 
   SearchImpl(Solver& s, Position& p, const Options& o, const Limits& l, bool (*stop_fn)(),
-             int tid = 0, std::atomic<bool>* sstop = nullptr, Color attacker = COLOR_NB)
+             int tid = 0, std::atomic<bool>* sstop = nullptr, Color attacker = COLOR_NB, bool main_cache = false)
       : solver(s), pos(p), opt(o), lim(l), should_stop(stop_fn), thread_id(tid), shared_stop(sstop) {
-    cache.resize(opt.cache_slots);
+    cache_n = static_cast<std::size_t>(std::max(0, opt.cache_slots));
+    ctag.assign(cache_n, CacheTag{});
+    if (main_cache && cache_n) {
+      cache = static_cast<CacheSlot*>(solver.MainCache(cache_n * sizeof(CacheSlot)));
+    } else {
+      cache_own.resize(cache_n);
+      cache = cache_own.data();
+    }
     atk = attacker == COLOR_NB ? pos.side_to_move() : attacker;
     def = ~atk;
     {
@@ -297,7 +316,22 @@ struct SearchImpl {
   static std::uint16_t TagLo(Key board) { return static_cast<std::uint16_t>(static_cast<std::uint64_t>(board) >> 16); }
 
   Cluster* GetCluster(Key board) {
-    return &solver.table_[static_cast<std::uint64_t>(board) % solver.cluster_count_];
+    return &solver.table_[solver.ClusterOf(board)];
+  }
+
+  // The slots of a cluster whose key word is `v` (bit i: slot i; all eight
+  // compared at once with AVX2).
+  static unsigned KeyHits(const Cluster* c, std::uint32_t v) {
+#if defined(USE_AVX2)
+    const __m256i keys = _mm256_load_si256(reinterpret_cast<const __m256i*>(c->key));
+    const __m256i eq = _mm256_cmpeq_epi32(keys, _mm256_set1_epi32(static_cast<int>(v)));
+    return static_cast<unsigned>(_mm256_movemask_ps(_mm256_castsi256_ps(eq)));
+#else
+    unsigned hits = 0;
+    for (int j = 0; j < kClusterSize; ++j)
+      if (c->key[j] == v) hits |= 1u << j;
+    return hits;
+#endif
   }
 
   // Holds the lock stripe of a cluster while helper threads are running.
@@ -305,7 +339,7 @@ struct SearchImpl {
     Solver::Lock* l = nullptr;
     ClusterLock(Solver& s, Key board) {
       if (!s.shared_) return;
-      l = &s.locks_[(static_cast<std::uint64_t>(board) % s.cluster_count_) & (Solver::kLocks - 1)];
+      l = &s.locks_[s.ClusterOf(board) & (Solver::kLocks - 1)];
       while (l->v.exchange(1, std::memory_order_acquire))
         while (l->v.load(std::memory_order_relaxed)) _mm_pause();
     }
@@ -327,17 +361,8 @@ struct SearchImpl {
     const std::uint16_t lo = TagLo(board);
     PnDn pn_lb = 1, dn_lb = 1;
     int disproof = -1;  // a proof takes precedence (disproofs may depend on the path)
-    // The slots whose upper key bits match (all eight compared at once).
-    unsigned hits = 0;
-#if defined(USE_AVX2)
-    const __m256i keys = _mm256_load_si256(reinterpret_cast<const __m256i*>(c->key));
-    const __m256i eq = _mm256_cmpeq_epi32(keys, _mm256_set1_epi32(static_cast<int>(hi)));
-    hits = static_cast<unsigned>(_mm256_movemask_ps(_mm256_castsi256_ps(eq)));
-#else
-    for (int j = 0; j < kClusterSize; ++j)
-      if (c->key[j] == hi) hits |= 1u << j;
-#endif
-    for (; hits; hits &= hits - 1) {
+    // The slots whose upper key bits match.
+    for (unsigned hits = KeyHits(c, hi); hits; hits &= hits - 1) {
       const int i = __builtin_ctz(hits);
       if (c->d[i].tag != lo) continue;
       const EntryData& e = c->d[i];
@@ -400,9 +425,16 @@ struct SearchImpl {
     board = NonZero(board);
     Cluster* c = GetCluster(board);
     ClusterLock lock(solver, board);
+    solver.MarkDirty(static_cast<std::size_t>(c - solver.table_.data()));  // (also when nothing is written below)
     const std::uint32_t hi = TagHi(board);
     const std::uint16_t lo = TagLo(board);
-    auto same_board = [&](int i) { return c->key[i] == hi && c->d[i].tag == lo; };
+    // The slots of this board (kept in step with the removals below).
+    unsigned same = 0;
+    for (unsigned h = KeyHits(c, hi); h; h &= h - 1) {
+      const int i = __builtin_ctz(h);
+      if (c->d[i].tag == lo) same |= 1u << i;
+    }
+    auto same_board = [&](int i) { return ((same >> i) & 1) != 0; };
     int target = -1;
     for (int i = 0; i < kClusterSize; ++i) {
       if (same_board(i) && c->d[i].Mode() == mode && c->d[i].hand == hand) {
@@ -449,14 +481,17 @@ struct SearchImpl {
       for (int i = 0; i < kClusterSize; ++i) {
         if (i == target || !same_board(i) || c->d[i].Mode() != mode) continue;
         const Hand eh = static_cast<Hand>(c->d[i].hand);
-        if (pn == 0 && hand_is_equal_or_superior(eh, hand)) c->key[i] = 0;
-        else if (dn == 0 && c->d[i].pn != 0 && hand_is_equal_or_superior(hand, eh)) c->key[i] = 0;
+        if ((pn == 0 && hand_is_equal_or_superior(eh, hand)) ||
+            (dn == 0 && c->d[i].pn != 0 && hand_is_equal_or_superior(hand, eh))) {
+          c->key[i] = 0;
+          same &= ~(1u << i);
+        }
       }
     }
     const std::uint16_t amt = EncodeAmount(amount);
     if (target < 0) {
-      for (int i = 0; i < kClusterSize; ++i)
-        if (c->key[i] == 0) { target = i; break; }
+      const unsigned empty = KeyHits(c, 0);
+      if (empty) target = __builtin_ctz(empty);
     }
     if (target < 0) {
       // Replace the least valuable entry: the one that would cost the least
@@ -553,6 +588,7 @@ struct SearchImpl {
   Key RepKey(Key path_key) const { return path_key && FullWidth() ? path_key ^ kFullWidthRepSalt : path_key; }
   bool rederive_root = false;
   int rederive_ply = -1;
+  bool skip_m1 = false;  // the node SearchChild enters was tested for mate in one already (Child.m1)
   Key ChildPathKey(Key full) const { return PathMix(CurrentPathKey(), full); }
   // Is the position at this path key disproven through a repetition with its path?
   // (either kind: the disproof check takes them as hints)
@@ -1124,6 +1160,7 @@ struct SearchImpl {
     std::vector<PnDn>* gmax;  // per group: the maximum of the summed number
     std::vector<int>* live;   // undecided active children
     CacheSlot* slot = nullptr;
+    CacheTag* tag = nullptr;  // the slot's keys
     bool cached = false;      // the children came from the cache
   };
 
@@ -1147,13 +1184,14 @@ struct SearchImpl {
   // The children of the node: those of a recently visited node from the
   // children cache (path-dependent values refreshed), else generated.
   void OpenNode(NodeWork& w, Key board, Hand hand, std::uint8_t mode, bool or_node, Move last, int ply) {
-    if (!cache.empty() && !force_full_width) {  // (the cache holds the candidates' children)
+    if (cache_n && !force_full_width) {  // (the cache holds the candidates' children)
       const std::uint64_t h = static_cast<std::uint64_t>(board) ^
                               (static_cast<std::uint64_t>(hand) * 0x9E3779B97F4A7C15ULL) ^ mode;
-      w.slot = &cache[(h >> 7) % cache.size()];
-      if (w.slot->in_use) w.slot = nullptr;  // used by an ancestor
-      w.cached = w.slot != nullptr && w.slot->valid && w.slot->board == board &&
-                 w.slot->hand == static_cast<std::uint32_t>(hand) && w.slot->mode == mode;
+      const std::size_t ix = (h >> 7) % cache_n;
+      w.tag = &ctag[ix];
+      w.slot = w.tag->in_use ? nullptr : &cache[ix];  // (in use: by an ancestor)
+      w.cached = w.slot != nullptr && w.tag->valid && w.tag->board == board &&
+                 w.tag->hand == static_cast<std::uint32_t>(hand) && w.tag->mode == mode;
     }
     if (w.cached) {
       CacheSlot& slot = *w.slot;
@@ -1162,7 +1200,7 @@ struct SearchImpl {
       w.active = slot.active;
       w.active_end = slot.active_end;
       // Work on the slot's children in place.
-      slot.in_use = 1;
+      w.tag->in_use = 1;
       w.ch.p = slot.ch;
       w.ch.n = slot.n;
       w.ch.cap = kCacheMaxChildren;
@@ -1236,6 +1274,21 @@ struct SearchImpl {
       c.len = p.len;
       c.rep = p.rep;
       c.ph = p.ph;
+      // A defender reply answered by mate in one is proven here (the MateInOne
+      // proof of SearchBody, without a SearchChild call and selection passes
+      // per reply; most replies to checks with many drops are such).
+      if (!p.found && !c.pass && opt.eager_mate1 && pos.side_to_move() == def && ply + 1 < opt.max_ply) {
+        StateInfo est;
+        pos.do_move(c.move, est);
+        NodeResult mr;
+        const bool m1 = !pos.in_check() && MateInOne(pos.hand_of(atk), mr);
+        pos.undo_move(c.move);
+        c.m1 = !m1;  // (in check: SearchBody skips the test too)
+        if (m1) {
+          ++nodes;
+          c.pn = 0; c.dn = kInf; c.len = mr.len; c.rep = 0; c.ph = mr.ph;
+        }
+      }
     }
     for (int i = b; i < e; ++i) w.live->push_back(i);
     ++w.active;
@@ -1263,8 +1316,9 @@ struct SearchImpl {
   void CloseNode(NodeWork& w, Key board, Hand hand, std::uint8_t mode, PnDn pn, PnDn dn) {
     if (w.slot != nullptr) {
       CacheSlot& slot = *w.slot;
+      CacheTag& tag = *w.tag;
       if (pn == 0 || dn == 0 || w.n < kCacheMinChildren || w.n > kCacheMaxChildren) {
-        if (w.cached) slot.valid = 0;  // leave another node's entry alone
+        if (w.cached) tag.valid = 0;  // leave another node's entry alone
       } else {
         if (!w.cached) {
           std::copy(w.ch.begin(), w.ch.end(), slot.ch);
@@ -1272,17 +1326,17 @@ struct SearchImpl {
           w.ch.p = slot.ch;
           w.fulls = slot.full;
         }
-        slot.valid = 1;
-        slot.board = board;
-        slot.hand = static_cast<std::uint32_t>(hand);
-        slot.mode = mode;
+        tag.valid = 1;
+        tag.board = board;
+        tag.hand = static_cast<std::uint32_t>(hand);
+        tag.mode = mode;
         slot.n = static_cast<std::uint16_t>(w.n);
         slot.groups = static_cast<std::uint16_t>(w.groups);
         slot.active = static_cast<std::uint8_t>(w.active);
         slot.active_end = static_cast<std::uint16_t>(w.active_end);
         slot.si = w.si;
       }
-      slot.in_use = 0;
+      tag.in_use = 0;
     }
     w.ch.n = w.active_end;
   }
@@ -1364,6 +1418,8 @@ struct SearchImpl {
     const Key board = BoardKey(pos);
     const Hand hand = pos.hand_of(atk);
     const std::uint64_t nodes_at_start = nodes;
+    const bool m1_tested = skip_m1;
+    skip_m1 = false;
 
     if (ply >= opt.max_ply) return NodeResult{kInf, 0, 0, true, hand};
 
@@ -1387,7 +1443,7 @@ struct SearchImpl {
     // A node with its own TT entry was expanded before; its one-ply mate
     // check already failed then.
     NodeResult mated;
-    if (or_node && !self.found && !pos.in_check() && MateInOne(hand, mated)) return mated;
+    if (or_node && !self.found && !m1_tested && !pos.in_check() && MateInOne(hand, mated)) return mated;
 
     NodeWork w;
     w.gmax = &gmax_buf[ply];
@@ -1535,6 +1591,9 @@ struct SearchImpl {
     StateInfo& st = states[ply];
     std::uint8_t cmode = mode;
     const Move m = c.move;
+    // The child's own TT probe (SearchBody) would wait on a cold cluster: the load starts before do_move.
+    _mm_prefetch(reinterpret_cast<const char*>(GetCluster(NonZero(c.pass ? (BoardKey(pos) ^ side_key) : pos.board_key_after(m)))),
+                 _MM_HINT_T0);
     if (c.pass) {
       pos.do_null_move(st);
       cmode = kModeMate;
@@ -1542,6 +1601,7 @@ struct SearchImpl {
       pos.do_move(m, st);
     }
     PushPath(PathEntry(pos.key(), cmode));
+    skip_m1 = c.m1 != 0;
     const NodeResult r = Search(ply + 1, cmode, thpn, thdn, c.pass ? MOVE_NONE : m);
     PopPath();
     if (c.pass) pos.undo_null_move();

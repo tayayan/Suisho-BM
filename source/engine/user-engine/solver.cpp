@@ -21,20 +21,54 @@ void Solver::Resize(std::size_t mb) {
   std::size_t clusters = (bytes > rep_bytes ? bytes - rep_bytes : 0) / sizeof(Cluster);
   if (clusters < 1024) clusters = 1024;
   if (clusters == cluster_count_ && !table_.empty() && rep_entries == rep_mask_ + 1) return;
-  table_.clear();
-  table_.shrink_to_fit();
-  table_.resize(clusters);
+  table_.Allocate(clusters);  // (the old table is freed first)
   cluster_count_ = clusters;
   rep_table_.reset();
   rep_table_.reset(new std::atomic<std::uint64_t>[rep_entries]);
   rep_mask_ = rep_entries - 1;
+  dirty_map_.assign(clusters, 0);
+  rep_dirty_bits_.assign((rep_entries / 8 + 63) / 64, 0);
+  full_clear_ = true;
   Clear();
 }
 
+// Only the clusters (repetition lines) written since the last Clear are
+// wiped; the whole table when many are marked (sequential is faster then) or
+// after Resize. (Clear runs inside the time limit of the next Solve.)
 void Solver::Clear() {
-  if (!table_.empty()) std::memset(static_cast<void*>(table_.data()), 0, table_.size() * sizeof(Cluster));
-  if (rep_table_)
-    for (std::size_t i = 0; i <= rep_mask_; ++i) rep_table_[i].store(0, std::memory_order_relaxed);
+  const std::size_t nm = dirty_map_.size();
+  const std::size_t nd = nm - static_cast<std::size_t>(std::count(dirty_map_.begin(), dirty_map_.end(), std::uint8_t{0}));
+  if (!table_.empty()) {
+    if (full_clear_ || nd * 8 > table_.size()) {
+      std::memset(static_cast<void*>(table_.data()), 0, table_.size() * sizeof(Cluster));
+    } else if (nd) {
+      // (8 marks per word: zero words skipped)
+      std::size_t k = 0;
+      for (; k + 8 <= nm; k += 8) {
+        std::uint64_t w;
+        std::memcpy(&w, &dirty_map_[k], 8);
+        if (!w) continue;
+        for (std::size_t j = 0; j < 8; ++j)
+          if (dirty_map_[k + j]) std::memset(static_cast<void*>(&table_[k + j]), 0, sizeof(Cluster));
+      }
+      for (; k < nm; ++k)
+        if (dirty_map_[k]) std::memset(static_cast<void*>(&table_[k]), 0, sizeof(Cluster));
+    }
+  }
+  if (nd) std::memset(dirty_map_.data(), 0, nm);
+  if (rep_table_) {
+    if (full_clear_) {
+      for (std::size_t i = 0; i <= rep_mask_; ++i) rep_table_[i].store(0, std::memory_order_relaxed);
+    } else {
+      for (std::size_t k = 0; k < rep_dirty_bits_.size(); ++k)
+        for (std::uint64_t w = rep_dirty_bits_[k]; w; w &= w - 1) {
+          const std::size_t b = ((k << 6) + __builtin_ctzll(w)) << 3;
+          for (std::size_t i = b; i < b + 8 && i <= rep_mask_; ++i) rep_table_[i].store(0, std::memory_order_relaxed);
+        }
+    }
+  }
+  std::fill(rep_dirty_bits_.begin(), rep_dirty_bits_.end(), 0);
+  full_clear_ = false;
   dirty_ = false;
 }
 
@@ -380,7 +414,7 @@ Result Solver::Solve(Position& root, const Limits& given_limits, const Options& 
   Options main_opt = opt;
   if (nthreads == 1 && main_opt.eps_percent == 0) main_opt.eps_percent = opt.single_thread_eps;
   main_opt.cache_slots = main_slots;
-  SearchImpl s(*this, root, main_opt, limits, should_stop, 0, nthreads > 1 ? &done : nullptr);
+  SearchImpl s(*this, root, main_opt, limits, should_stop, 0, nthreads > 1 ? &done : nullptr, COLOR_NB, true);
   s.report = true;
   s.root_sfen = ctx.root_sfen;
   NodeResult r = s.Run(kModeHisshi);

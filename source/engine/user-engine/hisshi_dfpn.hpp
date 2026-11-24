@@ -204,9 +204,11 @@ class Solver {
     const std::size_t i = path_key & rep_mask_;
     std::uint64_t& w = rep_dirty_bits_[i >> 9];
     const std::uint64_t m = 1ULL << ((i >> 3) & 63);
-    if (!(w & m)) {
-      if (shared_) __atomic_fetch_or(&w, m, __ATOMIC_RELAXED);
-      else w |= m;
+    if (shared_) {
+      // (helper threads set bits of the same word: atomic test and set)
+      if (!(__atomic_load_n(&w, __ATOMIC_RELAXED) & m)) __atomic_fetch_or(&w, m, __ATOMIC_RELAXED);
+    } else if (!(w & m)) {
+      w |= m;
     }
     rep_table_[i].store(path_key, std::memory_order_relaxed);
   }

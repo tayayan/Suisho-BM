@@ -181,7 +181,7 @@ namespace USI {
 		o["ThreadIdOffset"] << Option(0, 0, std::thread::hardware_concurrency() - 1);
 #endif
 
-#if defined(_WIN64) && !defined(USER_ENGINE)
+#if defined(_WIN64)
 		// LargePageを有効化するか。
 		// これを無効化できないと自己対局の時に片側のエンジンだけがLargePageを使うことがあり、
 		// 不公平になるため、無効化する方法が必要であった。

@@ -36,6 +36,17 @@ ifneq (,$(findstring g++,$(COMPILER)))
 	CPPFLAGS += -fno-asynchronous-unwind-tables
 endif
 
+# Profile-guided optimization (g++): make PGO_GEN=1 -> run the exe on problems
+# (the profile is written next to the objects) -> make -B PGO_USE=1 (same OBJDIR,
+# no clean in between). ../build.ps1 -Pgo does all three steps.
+ifneq (,$(PGO_GEN))
+	CPPFLAGS += -fprofile-generate -fprofile-update=prefer-atomic
+	LDFLAGS  += -fprofile-generate -fprofile-update=prefer-atomic
+endif
+ifneq (,$(PGO_USE))
+	CPPFLAGS += -fprofile-use -fprofile-partial-training
+endif
+
 # Windows: cmd/PowerShell set OS=Windows_NT; an MSYS2 login shell does not,
 # so check uname too. Link statically so that no MinGW DLLs are needed.
 UNAME := $(shell uname -s 2>/dev/null)

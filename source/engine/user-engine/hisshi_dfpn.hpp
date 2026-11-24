@@ -16,6 +16,7 @@
 #include <string>
 #include <vector>
 
+#include "../../misc.h"
 #include "../../position.h"
 
 namespace hisshi {
@@ -36,9 +37,9 @@ struct Options {
   bool full_width = false;   // attacker considers every legal move (else the candidates of paper 3.1)
   int non_check_cost = 2;    // cost of a non-checking attack in pn (df-pn+, paper: 2)
   int lazy_dn = 64;          // dn estimate of the not yet generated non-checking attacks
-  int lazy_pn = 1;           // pn estimate (h) of the not yet generated attacks, before their cost
+  int lazy_pn = 0;           // pn estimate (h) of the not yet generated attacks, before their cost
   int sim_budget = 4096;     // node limit of one proof replay
-  int check_stage_dn = 16;   // dn estimate of not yet activated interpositions
+  int check_stage_dn = 32;   // dn estimate of not yet activated interpositions
   int and_stage_dn = 16;     // dn estimate of not yet activated defences (the pass gets a head start)
   int cache_slots = 4096;    // children cache of the main thread (at most)
   int helper_cache_slots = 1024;  // children cache of each helper thread (at most)
@@ -50,6 +51,7 @@ struct Options {
   // (every interposition is a defence), 1 the futility rules with the chains
   // of interpositions judged from their end.
   int futile = 0;
+  bool eager_mate1 = true;  // defender replies mated in one are proven when their stage is activated
 };
 
 enum class Status { kUnknown, kProven, kDisproven };
@@ -133,10 +135,51 @@ class Solver {
   std::string StatsString() const;
   void SetShared(bool v) { shared_ = v; }
 
+  // The cluster of a board key: multiply-shift (no 64-bit division per probe).
+  std::size_t ClusterOf(Key board) const {
+    const std::uint64_t h = static_cast<std::uint64_t>(board) * 0x9E3779B97F4A7C15ULL;
+    return static_cast<std::size_t>((static_cast<unsigned __int128>(h) * cluster_count_) >> 64);
+  }
+  // Clusters written since the last Clear are marked (a byte each, a plain
+  // store), so that Clear wipes only those.
+  void MarkDirty(std::size_t ci) { __atomic_store_n(&dirty_map_[ci], static_cast<std::uint8_t>(1), __ATOMIC_RELAXED); }
+  // Children cache storage of the main search, kept across solves (bytes;
+  // on large pages when the OS gives them).
+  void* MainCache(std::size_t bytes) {
+    if (main_cache_bytes_ < bytes) {
+      main_cache_ = main_cache_mem_.alloc(bytes, 64, true);
+      main_cache_bytes_ = bytes;
+    }
+    return main_cache_;
+  }
+
  private:
   friend struct detail::SearchImpl;
-  std::vector<Cluster> table_;
+  // The clusters, on large pages when the OS gives them (LargeMemory; else
+  // ordinary pages). Read and written through the pointer only.
+  struct Table {
+    LargeMemory mem;
+    Cluster* p = nullptr;
+    std::size_t n = 0;
+    std::size_t size() const { return n; }
+    bool empty() const { return n == 0; }
+    Cluster* data() const { return p; }
+    Cluster& operator[](std::size_t i) const { return p[i]; }
+    Cluster* begin() const { return p; }
+    Cluster* end() const { return p + n; }
+    void Allocate(std::size_t count) {
+      p = static_cast<Cluster*>(mem.alloc(count * sizeof(Cluster), alignof(Cluster)));  // (zeroed by Clear)
+      n = count;
+    }
+  };
+  Table table_;
   std::size_t cluster_count_ = 0;
+  std::vector<std::uint8_t> dirty_map_;        // 1 byte per cluster (MarkDirty)
+  std::vector<std::uint64_t> rep_dirty_bits_;  // 1 bit per 8 repetition keys (one cache line)
+  bool full_clear_ = true;                     // the next Clear wipes everything (after Resize)
+  LargeMemory main_cache_mem_;
+  void* main_cache_ = nullptr;
+  std::size_t main_cache_bytes_ = 0;
 
   // Striped spin locks guarding the clusters while several threads search.
   struct alignas(64) Lock {
@@ -158,7 +201,14 @@ class Solver {
   std::size_t rep_mask_ = 0;  // entries - 1 (a power of two)
   std::unique_ptr<std::atomic<std::uint64_t>[]> rep_table_;
   void RepInsert(std::uint64_t path_key) {
-    rep_table_[path_key & rep_mask_].store(path_key, std::memory_order_relaxed);
+    const std::size_t i = path_key & rep_mask_;
+    std::uint64_t& w = rep_dirty_bits_[i >> 9];
+    const std::uint64_t m = 1ULL << ((i >> 3) & 63);
+    if (!(w & m)) {
+      if (shared_) __atomic_fetch_or(&w, m, __ATOMIC_RELAXED);
+      else w |= m;
+    }
+    rep_table_[i].store(path_key, std::memory_order_relaxed);
   }
   bool RepContains(std::uint64_t path_key) const {
     return path_key != 0 && rep_table_[path_key & rep_mask_].load(std::memory_order_relaxed) == path_key;

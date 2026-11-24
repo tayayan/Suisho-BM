@@ -337,6 +337,16 @@ struct DisproofVerifier {
   std::uint64_t trees = 0, trees_disproven = 0, tree_nodes = 0;
   std::uint64_t last_tree_nodes = 0;
   bool last_tree_full = false;
+  // The time limit or a stop request of the Solve ends the check unverified
+  // (the answer comes at the limit, not after the whole check).
+  bool cut = false;
+  bool Cut() {
+    if (!cut && ((s.lim.time_ms && static_cast<std::int64_t>(s.ElapsedMs()) >= s.lim.time_ms) ||
+                 (s.should_stop && s.should_stop())))
+      cut = true;
+    if (cut && error.empty()) error = "limit";
+    return cut;
+  }
 
   explicit DisproofVerifier(SearchImpl& si) : s(si), pos(si.pos) { st.resize(4096); }
 
@@ -356,6 +366,7 @@ struct DisproofVerifier {
       return true;
     }
     if (depth >= 4000) { error = "too deep"; return false; }
+    if (Cut()) return false;
     ++visited;
     const int index = static_cast<int>(on_path.size());
     on_path.push_back(k);
@@ -468,6 +479,7 @@ struct DisproofVerifier {
           return true;
         }
         if (!saved.empty()) error = saved;  // (keep the first failure)
+        if (cut) return false;
       }
       if (round == kRounds - 1 || s.LimitReached()) break;
       // Search this node again to find (another) disproof; a hard node gets
@@ -489,6 +501,7 @@ struct DisproofVerifier {
       budget *= 8;
       if (nr.pn == 0) break;  // (proven: no refuting reply)
     }
+    if (Cut()) return false;
     if (TreeRefutes(mode, dep)) {
       error.clear();
       return true;

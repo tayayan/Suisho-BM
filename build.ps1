@@ -6,7 +6,10 @@ param(
     [ValidateRange(1, 256)]
     [int]$Jobs = [Environment]::ProcessorCount,
     # Recompile every object (after changing the compiler or TargetCpu).
-    [switch]$Rebuild
+    [switch]$Rebuild,
+    # Profile-guided optimization: build, solve the positions in pgo.sfen
+    # (1 second each), then build again with the profile (a few minutes).
+    [switch]$Pgo
 )
 
 Set-StrictMode -Version Latest
@@ -19,8 +22,13 @@ if (-not (Test-Path -LiteralPath $bash -PathType Leaf)) {
 
 $root = [IO.Path]::GetFullPath($PSScriptRoot)
 $unixRoot = '/' + $root.Substring(0, 1).ToLowerInvariant() + $root.Substring(2).Replace('\', '/')
-$clean = if ($Rebuild) { 'make clean && ' } else { '' }
-$command = "cd '$unixRoot/source' && $clean" + "make -j$Jobs TARGET_CPU=$TargetCpu"
+$clean = if ($Rebuild -or $Pgo) { 'make clean && ' } else { '' }
+$make = "make -j$Jobs TARGET_CPU=$TargetCpu"
+$command = "cd '$unixRoot/source' && $clean$make"
+if ($Pgo) {
+    $train = "../Suisho-BM.exe bench hash 512 threads 1 limit 1000 type mate file ../pgo.sfen , quit > /dev/null"
+    $command = "cd '$unixRoot/source' && $clean$make PGO_GEN=1 && $train && $make -B PGO_USE=1"
+}
 
 $oldMsystem = $env:MSYSTEM
 $oldPreference = $ErrorActionPreference

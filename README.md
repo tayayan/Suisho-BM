@@ -40,6 +40,7 @@ Windows では [MSYS2](https://www.msys2.org/) の MinGW64 環境（g++）でビ
 ```powershell
 .\build.ps1                     # AVX2（Intel 等）
 .\build.ps1 -TargetCpu ZEN2     # AMD Zen 2（BMI2 が遅い CPU）
+.\build.ps1 -Pgo                # PGO（pgo.sfenの局面を1秒ずつ解いた結果で最適化。数分かかります）
 .\build.ps1 -Rebuild            # 全オブジェクトを作り直す
 ```
 
@@ -50,6 +51,8 @@ MSYS2 のシェルから直接 make を実行することもできます（Linux
 cd source
 make -j8 TARGET_CPU=AVX2
 ```
+
+makeでのPGOは、`make clean`→`make PGO_GEN=1`→実行ファイルで局面を解く（`build.ps1 -Pgo`は`bench`コマンドでpgo.sfenを解きます）→`make -B PGO_USE=1`の順です。
 
 `TARGET_CPU` には `AVX2`、`ZEN2`、`ZEN3`、`AVX512`、`SSE42`、`SSE41`、`SSE2` を指定できます。
 実行ファイルはリポジトリ直下の `Suisho-BM.exe` です（Linux では `Suisho-BM`）。
@@ -90,6 +93,7 @@ checkmate S*2c 2b1c 2c3d+
 |---|---|---|
 | `USI_Hash` | 1024 | 置換表の大きさ（MB）。難しい問題では 2048MB 程度に増やすと安定します。このうち 16 分の 1 は、循環に依存する不必至を経路ごとに記録する表に使います。置換表のほかに、この値の 4 割程度までの補助メモリ（子局面のキャッシュ・検証用の表）を使います |
 | `Threads` | 1 | 探索スレッド数。検証と解答作成も、このスレッド数で並列に行います |
+| `LargePageEnable` | true | 置換表と子局面のキャッシュをラージページに置きます（Windowsのみ、「メモリ内のページのロック」の権限が必要）。確保できないときは通常のページを使います |
 | `PvInterval` | 1000 | 進捗出力の間隔（ms）。0 にすると出力しません |
 | `HisshiFullWidth` | false | 探索でも攻方の全合法手を生成します（遅くなります）。既定では論文の候補手に絞って探索します（不必至の検証は、どちらでも全合法手で行います） |
 | `HisshiFutile` | false | 解答手順の無駄合いの扱い。false は合駒もすべて受けとして手順に含めます。true は無駄合いを除きます（解答作成に時間がかかり、手数制限付き探索のために置換表とは別に 128MB を使います） |
@@ -124,6 +128,7 @@ checkmate S*2c 2b1c 2c3d+
 | `source/engine/user-engine/user-search.cpp` | USI との接続 |
 | `source/` のその他 | やねうら王から必要な部分だけを抜き出したもの（盤面・指し手生成・1 手詰め・USI など） |
 | `build.ps1` / `source/Makefile` | ビルド |
+| `pgo.sfen` | PGOビルドで解かせる局面（200局面） |
 
 ## クレジット・ライセンス
 
